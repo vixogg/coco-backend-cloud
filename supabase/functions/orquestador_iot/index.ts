@@ -1,7 +1,6 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from "@supabase/supabase-js";
 
-serve(async (req) => {
+Deno.serve(async (req) => {
   try {
     // 1. Recepcion del Webhook desde AWS IoT Core
     const payloadIoT = await req.json();
