@@ -1,105 +1,270 @@
 import { createClient } from "@supabase/supabase-js";
 
+// 1. Importaciones de la IA
+import { transcribeAudio } from "./services/sttService.ts";
+import { classifyTranscription } from "./services/llmService.ts";
+import { synthesizeSpeech, signRequest } from "./services/ttsService.ts";
+
+// 2. Funciones auxiliares para manejar el audio
+function decodeBase64ToUint8Array(base64: string): Uint8Array {
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/* =========================================================================
+   SECCIÓN 1: CONFIGURACIÓN E INICIALIZACIÓN
+   ========================================================================= */
+const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const supabase = createClient(supabaseUrl, supabaseKey);
+
 Deno.serve(async (req) => {
+  /* =========================================================================
+     SECCIÓN 2: VALIDACIÓN DEL WEBHOOK Y CONTRATO DE ENTRADA (Tx)
+     ========================================================================= */
+  console.log(`\n=== NUEVA PETICIÓN ENTRANTE ===`);
+  console.log(`[HTTP] Método: ${req.method} | URL: ${req.url}`);
+
+  if (req.method !== "POST") {
+    console.warn(`[BLOQUEO] Método ${req.method} no permitido.`);
+    return new Response(JSON.stringify({ error: "Método no permitido" }), { status: 405 });
+  }
+
   try {
-    // 1. Recepcion del Webhook desde AWS IoT Core
-    const payloadIoT = await req.json();
-    const { mac_address, tipo_evento, formato_payload, data } = payloadIoT;
+    // Leemos el payload como texto crudo para auditarlo antes de que falle
+    const bodyText = await req.text();
+    console.log(`[PAYLOAD CRUDO RECIBIDO]:\n`, bodyText);
 
-    if (!mac_address || !tipo_evento || !formato_payload || !data) {
-      return new Response(
-        JSON.stringify({ error: "Payload invalido segun el Contrato IOT." }), 
-        { status: 400, headers: { "Content-Type": "application/json" } }
-      );
+    const payload = JSON.parse(bodyText); 
+    const { mac_address, tipo_evento, formato_payload, data } = payload;
+
+    if (!mac_address || !tipo_evento || !data || !formato_payload) {
+      console.warn(`[BLOQUEO] Contrato JSON inválido o incompleto. Faltan campos.`);
+      return new Response(JSON.stringify({ error: "Contrato JSON inválido o incompleto" }), { status: 400 });
     }
 
-    // Inicializar cliente de Supabase para consultas a la Base de Datos
-    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
-    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-    const supabase = createClient(supabaseUrl, supabaseKey);
-
-    let intencionFinal = "";
-    let destinatario = null;
-    let respuestaAudio = "";
-
-    // 2. Clasificacion de Evento: Fisico vs Voz
-    if (tipo_evento === "BOTON_SOS") {
-      // Si el evento viene del boton fisico, definimos la intencion directamente
-      intencionFinal = "ALERTA_SOS";
-      
-    } else if (tipo_evento === "MENSAJE") {
-      // TODO: Peticion HTTP real a los modelos de Inteligencia Artificial
-      // Aqui se debe enviar el audio en Base64 ('data') a Deepgram para STT
-      // y luego el texto a Claude 3 Haiku para extraer la intencion y generar respuesta.
-      /*
-      const responseIA = await fetch("URL_DE_TU_SERVICIO_DE_IA_O_CONTENEDOR", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${Deno.env.get("IA_API_KEY")}` },
-        body: JSON.stringify({
-          audio_b64: data,
-          contexto: "Instrucciones de prompt engineering"
-        })
-      });
-      const resultadoIA = await responseIA.json();
-      
-      intencionFinal = resultadoIA.intencion_detectada;
-      destinatario = resultadoIA.destinatario_identificado;
-      respuestaAudio = resultadoIA.respuesta_sintetizada;
-      */
+    if (formato_payload !== "AUDIO_B64" && formato_payload !== "TEXTO") {
+      console.warn(`[BLOQUEO] Formato de payload no soportado: ${formato_payload}`);
+      return new Response(JSON.stringify({ error: "Formato de payload no soportado" }), { status: 400 });
     }
 
-    // 3. Enrutamiento y Ejecucion de Acciones en Backend
-    if (intencionFinal === "ALERTA_SOS") {
-      // Ejecucion de notificacion a la red de apoyo
-      // TODO: 1. Consultar la tabla 'red_apoyo' para obtener los tokens de los familiares vinculados a este mac_address
-      /*
-      const { data: familiares, error } = await supabase
-        .from('red_apoyo')
-        .select('push_token')
-        .eq('dispositivo_mac', mac_address);
-      
-      if (error) throw error;
-      */
+    /* =========================================================================
+       SECCIÓN 3: SEGURIDAD Y VERIFICACIÓN DEL GEMELO DIGITAL
+       ========================================================================= */
+    const { data: dispositivo, error: errorDispositivo } = await supabase
+      .from("dispositivos_coco")
+      .select("id, id_adulto_mayor")
+      .eq("mac_address", mac_address)
+      .single();
 
-      // TODO: 2. Disparar notificacion Push a Firebase Cloud Messaging (FCM) o servicio nativo
-      /*
-      await fetch("https://fcm.googleapis.com/fcm/send", {
-        method: "POST",
-        headers: { "Authorization": `key=${Deno.env.get("FCM_SERVER_KEY")}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          registration_ids: familiares.map(f => f.push_token),
-          notification: { title: "¡Emergencia COCO!", body: "El dispositivo ha emitido una alerta SOS." }
-        })
-      });
-      */
-      
-    } else if (intencionFinal === "MENSAJE" || intencionFinal === "AUDIO_PENDIENTE") {
-      // TODO: Enviar audio de respuesta (TTS de Amazon Polly o confirmacion) de vuelta al dispositivo
-      // Esto requiere hacer una peticion HTTP a la API de AWS IoT Core publicando en el topico Rx del hardware
-      /*
-      await fetch(`https://TU_ENDPOINT_AWS.iot.region.amazonaws.com/topics/coco/dispositivos/${mac_address}/rx`, {
-        method: "POST",
-        headers: { "x-amzn-iot-thingname": mac_address },
-        body: JSON.stringify({
-          mac_address: mac_address,
-          tipo_evento: "RESPUESTA_IA",
-          formato_payload: "AUDIO_B64",
-          data: respuestaAudio // Previamente convertido a Base64
-        })
-      });
-      */
+    if (errorDispositivo || !dispositivo) {
+      console.warn(`[BLOQUEO] Dispositivo no registrado en BD: ${mac_address}`);
+      return new Response(JSON.stringify({ error: "Dispositivo no autorizado" }), { status: 403 });
     }
 
-    // 4. Cierre del Webhook
-    return new Response(
-      JSON.stringify({ status: "success", intencion: intencionFinal }),
-      { status: 200, headers: { "Content-Type": "application/json" } }
-    );
+    /* =========================================================================
+       SECCIÓN 4: ORQUESTACIÓN IA Y BYPASS DE HARDWARE
+       ========================================================================= */
+    // TypeScript requiere que el objeto sea 'const' si no lo reasignamos por completo.
+    const resultadoIA = {
+      intencion_detectada: "",
+      texto_procesado: null as string | null,
+      destinatario_identificado: null as string | null,
+      prioridad_sugerida: "NORMAL",
+      audio_respuesta_b64: "",
+      url_storage: null as string | null,
+      tipo_evento_bajada: "RESPUESTA_IA" 
+    };
+
+    if (tipo_evento === "ALERTA_SOS" && formato_payload === "TEXTO" && data === "EMERGENCIA_BOTON_PANICO") {
+      // CASO 1: BYPASS Botón físico (Saltamos Deepgram y Gemini)
+      console.log(`[BYPASS IA] Botón de pánico físico presionado para MAC: ${mac_address}`);
+      resultadoIA.intencion_detectada = "ALERTA_SOS";
+      resultadoIA.prioridad_sugerida = "URGENTE";
+      resultadoIA.texto_procesado = "Emergencia activada mecánicamente mediante botón de pánico.";
+      
+      const synthesizedAudio = await synthesizeSpeech("Alerta de emergencia enviada a tu familia. Mantén la calma.");
+      resultadoIA.audio_respuesta_b64 = uint8ArrayToBase64(synthesizedAudio);
+
+    } else if (tipo_evento === "AUDIO_DIRECTO" && formato_payload === "AUDIO_B64") {
+      // CASO 2: BYPASS Nota de Voz (Sube al Bucket audios_directos_coco)
+      console.log(`[STORAGE] Recibiendo nota de voz directa para MAC: ${mac_address}`);
+      
+      const audioBytes = decodeBase64ToUint8Array(data);
+      const fileName = `${mac_address}_${Date.now()}.wav`;
+
+      const { error: uploadError } = await supabase
+        .storage
+        .from('audios_directos_coco')
+        .upload(fileName, audioBytes, { contentType: 'audio/wav' });
+
+      if (uploadError) throw new Error(`Fallo al subir a Storage: ${uploadError.message}`);
+
+      const { data: publicUrlData } = supabase
+        .storage
+        .from('audios_directos_coco')
+        .getPublicUrl(fileName);
+
+      resultadoIA.intencion_detectada = "AUDIO_DIRECTO";
+      resultadoIA.texto_procesado = "🎤 Nota de voz entrante";
+      resultadoIA.url_storage = publicUrlData.publicUrl; // Guardamos la URL pública
+      resultadoIA.tipo_evento_bajada = "RESPUESTA_IA"; // Retorna a la normalidad el hardware
+      
+      const synthesizedAudio = await synthesizeSpeech("Audio enviado a tu familia exitosamente.");
+      resultadoIA.audio_respuesta_b64 = uint8ArrayToBase64(synthesizedAudio);
+
+    } else if (formato_payload === "AUDIO_B64") {
+      // CASO 3: FLUJO NORMAL Procesamiento de Voz con IA
+      console.log(`[PROCESAMIENTO IA] Audio recibido para MAC: ${mac_address}`);
+      const decodedAudio = decodeBase64ToUint8Array(data);
+      const transcription = await transcribeAudio(decodedAudio);
+      
+      const classification = await classifyTranscription(transcription, mac_address, tipo_evento);
+      const synthesizedAudio = await synthesizeSpeech(classification.respuesta_sintetizada);
+      
+      resultadoIA.intencion_detectada = classification.intencion_detectada;
+      resultadoIA.texto_procesado = transcription;
+      resultadoIA.destinatario_identificado = classification.destinatario_identificado;
+      resultadoIA.prioridad_sugerida = classification.prioridad_sugerida;
+      resultadoIA.audio_respuesta_b64 = uint8ArrayToBase64(synthesizedAudio);
+
+      // LA MAGIA DE LA OPCIÓN A: Si la IA detecta que el abuelo quiere enviar un mensaje directo (Nota de voz)
+      if (classification.intencion_detectada === "AUDIO_DIRECTO" && classification.destinatario_identificado) {
+        resultadoIA.tipo_evento_bajada = "CONFIRMACION_ESCUCHA"; // Gatillo para el simulador de Andrés
+        console.log(`[TRIGGER HARDWARE] Solicitando modo grabación a la placa mediante CONFIRMACION_ESCUCHA`);
+      }
+    } else {
+      return new Response(JSON.stringify({ error: "Combinación de payload no válida" }), { status: 400 });
+    }
+
+    /* =========================================================================
+       SECCIÓN 5: LÓGICA DE ENRUTAMIENTO Y PERSISTENCIA (El Cerebro)
+       ========================================================================= */
+       
+    const tipo_evento_db: string = resultadoIA.intencion_detectada;
+
+    let destinatario_uuid = null;
+    
+    if (tipo_evento_db === "MENSAJE" && resultadoIA.destinatario_identificado) {
+      console.log(`[RUTEO] Buscando UUID para el apodo/rol: ${resultadoIA.destinatario_identificado}`);
+      const { data: contacto } = await supabase
+        .from("red_apoyo")
+        .select("usuario_app_id")
+        .eq("dispositivo_id", dispositivo.id)
+        .eq("activo", true)
+        .or(`rol.ilike.%${resultadoIA.destinatario_identificado}%,apodos_reconocimiento.cs.{${resultadoIA.destinatario_identificado}}`)
+        .limit(1)
+        .single();
+        
+      if (contacto) destinatario_uuid = contacto.usuario_app_id;
+    }
+
+    const metadata_payload = {
+      texto_procesado: resultadoIA.texto_procesado,
+      url_audio_referencia: resultadoIA.url_storage, // Mapea la URL del bucket si existe
+      procesado_por_ia: formato_payload === "AUDIO_B64" && !resultadoIA.url_storage
+    };
+
+    const { error: errorInsert } = await supabase
+      .from("historial_interacciones")
+      .insert({
+        dispositivo_id: dispositivo.id,
+        emisor: 'COCO',
+        destinatario_id: destinatario_uuid,
+        tipo_evento: tipo_evento_db,
+        metadata_payload: metadata_payload,
+        estado_reproduccion: 'PENDIENTE',
+        prioridad: resultadoIA.prioridad_sugerida
+      });
+
+    if (errorInsert) throw new Error(`Fallo al guardar en historial: ${errorInsert.message}`);
+
+    switch (tipo_evento_db) {
+      case "ALERTA_SOS":
+        console.log(`[EMERGENCIA] Alerta SOS registrada para el dispositivo ${dispositivo.id}.`);
+        break;
+      case "MENSAJE":
+        console.log(`[MENSAJE] Entregado al buzón asíncrono del UUID: ${destinatario_uuid || 'Desconocido'}.`);
+        break;
+      case "AUDIO_DIRECTO":
+        console.log(`[AUDIO DIRECTO] Rutina ejecutada (Charla o Nota de Voz).`);
+        break;
+      case "RECORDATORIO":
+        console.log(`[RECORDATORIO] Lógica de agendamiento pospuesta para Fase 2.`);
+        break;
+    }
+
+    /* =========================================================================
+       SECCIÓN 6: ENRUTAMIENTO Y CANAL DE BAJADA (Rx) HACIA AWS IOT CORE
+       ========================================================================= */
+    const payloadDescendente = {
+      mac_address: mac_address,
+      tipo_evento: resultadoIA.tipo_evento_bajada, 
+      formato_payload: "AUDIO_B64",
+      data: resultadoIA.audio_respuesta_b64,
+      prioridad: resultadoIA.prioridad_sugerida
+    };
+
+    const iotEndpoint = Deno.env.get("AWS_IOT_ENDPOINT"); 
+    const iotRegion = Deno.env.get("AWS_IOT_REGION") ?? "us-east-2";
+    const iotAccessKey = Deno.env.get("AWS_IOT_ACCESS_KEY_ID");
+    const iotSecretKey = Deno.env.get("AWS_IOT_SECRET_ACCESS_KEY");
+
+    if (!iotEndpoint || !iotAccessKey || !iotSecretKey) {
+      throw new Error("Faltan credenciales de AWS IoT Core en el .env");
+    }
+
+    const topicRx = `coco/dispositivos/${mac_address}/rx`;
+    const publishUrl = `${iotEndpoint}/topics/${encodeURIComponent(topicRx)}?qos=1`;
+    const bodyStr = JSON.stringify(payloadDescendente);
+
+    const iotHeaders = await signRequest({
+      method: "POST",
+      url: publishUrl,
+      body: bodyStr,
+      region: iotRegion,
+      service: "iotdevicegateway", 
+      accessKeyId: iotAccessKey,
+      secretAccessKey: iotSecretKey,
+      now: new Date()
+    });
+
+    console.log(`Enviando audio de vuelta a AWS IoT Core en tópico: ${topicRx}`);
+    const iotResponse = await fetch(publishUrl, {
+      method: "POST",
+      headers: {
+        ...iotHeaders,
+        "Content-Type": "application/json"
+      },
+      body: bodyStr
+    });
+
+    if (!iotResponse.ok) {
+      const errTexto = await iotResponse.text();
+      console.error("Fallo al enviar a AWS IoT:", iotResponse.status, errTexto);
+      throw new Error("No se pudo entregar el mensaje al dispositivo físico");
+    }
+
+    return new Response(JSON.stringify({ success: true, message: "Orquestación exitosa" }), { 
+      status: 200, 
+      headers: { "Content-Type": "application/json" } 
+    });
 
   } catch (error) {
-    return new Response(
-      JSON.stringify({ error: "Fallo interno en el procesamiento del Webhook." }), 
-      { status: 500, headers: { "Content-Type": "application/json" } }
-    );
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error("Error crítico en orquestador_iot:", errorMessage);
+    return new Response(JSON.stringify({ error: "Fallo interno en el orquestador" }), { status: 500 });
   }
 });
