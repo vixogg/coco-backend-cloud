@@ -1,9 +1,10 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient } from "npm:@supabase/supabase-js";
 
 // 1. Importaciones de la IA
 import { transcribeAudio } from "./services/sttService.ts";
 import { classifyTranscription } from "./services/llmService.ts";
-import { synthesizeSpeech, signRequest } from "./services/ttsService.ts";
+import { synthesizeSpeech} from "./services/ttsService.ts";
+import { AwsClient } from "npm:aws4fetch";
 
 // 2. Funciones auxiliares para manejar el audio
 function decodeBase64ToUint8Array(base64: string): Uint8Array {
@@ -65,7 +66,7 @@ Deno.serve(async (req) => {
        ========================================================================= */
     const { data: dispositivo, error: errorDispositivo } = await supabase
       .from("dispositivos_coco")
-      .select("id, id_adulto_mayor")
+      .select("id, adulto_mayor_id")
       .eq("mac_address", mac_address)
       .single();
 
@@ -206,8 +207,14 @@ Deno.serve(async (req) => {
         break;
     }
 
-    /* =========================================================================
+/* =========================================================================
        SECCIÓN 6: ENRUTAMIENTO Y CANAL DE BAJADA (Rx) HACIA AWS IOT CORE
+       =====================================================================
+       FIX: Se reemplazó la función signRequest manual por aws4fetch.
+       La firma SigV4 manual calculaba mal el canonical URI (slashes del
+       tópico MQTT), el query string (?qos=1) y/o el hash del body,
+       causando un 403 Signature Mismatch permanente.
+       aws4fetch delega todo el proceso de firma a SubtleCrypto nativo.
        ========================================================================= */
     const payloadDescendente = {
       mac_address: mac_address,
@@ -216,47 +223,50 @@ Deno.serve(async (req) => {
       data: resultadoIA.audio_respuesta_b64,
       prioridad: resultadoIA.prioridad_sugerida
     };
-
-    const iotEndpoint = Deno.env.get("AWS_IOT_ENDPOINT"); 
+    // Leer credenciales de AWS IoT Core desde los secrets de Supabase
+    const rawEndpoint = Deno.env.get("AWS_IOT_ENDPOINT") || "";
+    const cleanEndpoint = rawEndpoint.replace(/^https?:\/\//, '');
     const iotRegion = Deno.env.get("AWS_IOT_REGION") ?? "us-east-2";
-    const iotAccessKey = Deno.env.get("AWS_IOT_ACCESS_KEY_ID");
-    const iotSecretKey = Deno.env.get("AWS_IOT_SECRET_ACCESS_KEY");
-
-    if (!iotEndpoint || !iotAccessKey || !iotSecretKey) {
-      throw new Error("Faltan credenciales de AWS IoT Core en el .env");
+    const iotAccessKey = Deno.env.get("AWS_IOT_ACCESS_KEY_ID") ?? "";
+    const iotSecretKey = Deno.env.get("AWS_IOT_SECRET_ACCESS_KEY") ?? "";
+    if (!cleanEndpoint || !iotAccessKey || !iotSecretKey) {
+      throw new Error("Faltan credenciales de AWS IoT Core en los secrets");
     }
-
-    const topicRx = `coco/dispositivos/${mac_address}/rx`;
-    const publishUrl = `${iotEndpoint}/topics/${encodeURIComponent(topicRx)}?qos=1`;
-    const bodyStr = JSON.stringify(payloadDescendente);
-
-    const iotHeaders = await signRequest({
-      method: "POST",
-      url: publishUrl,
-      body: bodyStr,
-      region: iotRegion,
-      service: "iotdevicegateway", 
+    // Instanciar el cliente aws4fetch con servicio 'iotdata' explícito
+    // aws4fetch usa SubtleCrypto (Web API nativa de Deno) para la firma SigV4
+    const awsClient = new AwsClient({
       accessKeyId: iotAccessKey,
       secretAccessKey: iotSecretKey,
-      now: new Date()
+      region: iotRegion,
+      service: "iotdata",
     });
-
-    console.log(`Enviando audio de vuelta a AWS IoT Core en tópico: ${topicRx}`);
-    const iotResponse = await fetch(publishUrl, {
+    // Construir la URL de publicación
+    // aws4fetch maneja la canonicalización de los slashes '/' en el tópico
+    // MQTT internamente de forma segura — NO usar encodeURIComponent aquí
+    const topicRx = `coco/dispositivos/${mac_address}/rx`;
+    const publishUrl = `https://${cleanEndpoint}/topics/${topicRx}?qos=1`;
+    const bodyStr = JSON.stringify(payloadDescendente);
+    console.log(`[IoT TX] Enviando audio de vuelta en tópico: ${topicRx}`);
+    console.log(`[IoT TX] URL: ${publishUrl}`);
+    console.log(`[IoT TX] Payload size: ${bodyStr.length} bytes`);
+    // aws4fetch.fetch() firma automáticamente:
+    // - Canonical URI (con slashes intactos)
+    // - Canonical Query String (qos=1)
+    // - Hash SHA-256 del body
+    // - Headers requeridos (Host, X-Amz-Date, Authorization)
+    const iotResponse = await awsClient.fetch(publishUrl, {
       method: "POST",
-      headers: {
-        ...iotHeaders,
-        "Content-Type": "application/json"
-      },
-      body: bodyStr
+      headers: { "Content-Type": "application/json" },
+      body: bodyStr,
     });
-
     if (!iotResponse.ok) {
       const errTexto = await iotResponse.text();
-      console.error("Fallo al enviar a AWS IoT:", iotResponse.status, errTexto);
+      console.error(`[IoT TX ERROR] Status: ${iotResponse.status}`);
+      console.error(`[IoT TX ERROR] Body: ${errTexto}`);
+      console.error(`[IoT TX ERROR] Headers:`, Object.fromEntries(iotResponse.headers.entries()));
       throw new Error("No se pudo entregar el mensaje al dispositivo físico");
     }
-
+    console.log(`[IoT TX OK] Mensaje entregado exitosamente al dispositivo.`);
     return new Response(JSON.stringify({ success: true, message: "Orquestación exitosa" }), { 
       status: 200, 
       headers: { "Content-Type": "application/json" } 
