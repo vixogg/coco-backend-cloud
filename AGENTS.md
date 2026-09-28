@@ -96,4 +96,138 @@ export interface GeminiResponse {
 - Se usa `.maybeSingle()` para la consulta de `red_apoyo` (en lugar de `.single()`) para manejar el caso fallback sin lanzar excepción de "no rows found".
 - `synthesizeSpeech()` de Polly retorna `Uint8Array`. La concatenación de bytes es a nivel de array crudo, por lo que en modo AUDIO se genera un único stream binario MP3+original. El hardware de Andrés lo recibirá como un solo bloque Base64.
 - JWT del emisor **omitido intencionalmente** en esta iteración por requerimiento del desarrollador (modo desarrollo). Para producción, agregar `req.headers.get("Authorization")` y verificar contra `supabase.auth.getUser(token)`.
-- `tipo_evento` en el payload descendente es `"MENSAJE"` (no `"MENSAJE_FAMILIAR"` como estaba en el placeholder anterior). Esto alinea con el enum `TipoEvento` definido en `types.ts` del orquestador.
+- `tipo_evento` en el payload descendente es `"MENSAJE"` (no `"MENSAJE_FAMILIAR"` como estaba en el placeholder anterior). Esto alinea con el enum `TipoEvento` definido en `types.ts` del orquestador.
+
+---
+
+### Iteración 2 — Refinamiento Storage SDK en app_mensajeria (2026-09-23)
+
+**Objetivo:** Reemplazar la descarga pública con `fetch()` por integración segura con Supabase Storage SDK, garantizar concatenación robusta de bytes y añadir auditoría del path en historial.
+
+**Archivos tocados:**
+- `supabase/functions/app_mensajeria/index.ts` — 3 bloques modificados quirúrgicamente.
+
+**Cambios específicos:**
+
+1. **Descarga segura con Storage SDK** (antes: `fetch(audio_url)` público):
+   ```typescript
+   const { data: blobDescargado, error: errorStorage } = await supabase
+     .storage
+     .from("audios_directos_coco")
+     .download(audio_url!); // audio_url es PATH interno, no URL pública
+   ```
+   El `service_role_key` del cliente ya inicializado da acceso a buckets privados sin URLs firmadas.
+
+2. **Manejo de error 404 de Storage** — Se añadió clase `StorageNotFoundError` para diferenciar "archivo no encontrado en bucket" de errores genéricos de BD o TTS. Logs descriptivos incluyen el path que falló.
+
+3. **Concatenación explícita de bytes** (más clara que la función helper anterior):
+   ```typescript
+   const totalLength = audioIntroBytes.length + audioOriginalBytes.length;
+   const audioUnificado = new Uint8Array(totalLength);
+   audioUnificado.set(audioIntroBytes, 0);
+   audioUnificado.set(audioOriginalBytes, audioIntroBytes.length);
+   ```
+
+4. **Auditoría en metadata_payload** — Campo `url_audio_referencia` renombrado a `ruta_storage` para comunicar semánticamente que es un path de bucket, no una URL HTTP. Permite recuperar el archivo original en el futuro sin URLs firmadas expiradas.
+
+**Contrato de entrada actualizado para tipo_mensaje AUDIO:**
+```json
+{
+  "mac_address": "00:11:22:AA:BB:CC",
+  "emisor_id": "uuid-del-familiar",
+  "tipo_mensaje": "AUDIO",
+  "texto": null,
+  "audio_url": "mensajes/nota_123.wav"
+}
+```
+`audio_url` ahora es el **path interno** del archivo en el bucket `audios_directos_coco`, no una URL pública.
+
+---
+
+### Iteración 3 — Doble Despacho MQTT y Ajuste de Metadata (2026-09-23)
+
+**Objetivo:** (1) Resolver incompatibilidad de codecs entre la intro de Polly (WAV/MP3) y la nota de voz de la app (AAC) mediante un patrón de Doble Despacho Secuencial. (2) Alinear las llaves de `metadata_payload` con el contrato de la UI de Martín.
+
+**Archivos tocados:**
+- `supabase/functions/app_mensajeria/index.ts` — Refactoring del PASO 5+7 y del PASO 6.
+
+**Cambios específicos:**
+
+1. **Doble Despacho Secuencial (Caso B — AUDIO):**
+   - El antiguo patrón concatenaba bytes en memoria y enviaba un solo payload MQTT. Esto corrompe el audio porque la placa no puede decodificar un stream que mezcla MP3 (Polly) con AAC (App).
+   - Nuevo patrón:
+     1. Polly sintetiza la intro → Base64 → **Primer MQTT publish** (firma SigV4).
+     2. `await new Promise(resolve => setTimeout(resolve, 3500))` — delay para dar tiempo al hardware de reproducir la intro completa.
+     3. `supabase.storage.from("audios_directos_coco").download(path)` → Base64 → **Segundo MQTT publish** (misma instancia `AwsClient`, mismo tópico).
+
+2. **Función auxiliar `publicarEnIoT(audioB64, etiquetaLog)`:**
+   - Centraliza el bloque `awsClient.fetch + validación de respuesta` para evitar duplicación. Se invoca hasta 2 veces en el Caso B.
+   - Credenciales AWS y `AwsClient` se instancian **una sola vez** fuera de los casos A/B.
+
+3. **Caso A (TEXTO) sin cambio de comportamiento:**
+   - Sigue usando un único TTS del string completo (intro + texto) y un único MQTT publish.
+
+4. **Actualización de `metadata_payload`** para alinearse con la UI de Martín:
+   ```typescript
+   metadata_payload: {
+     texto_procesado: tipo_mensaje === "TEXTO" ? texto : null,
+     url_audio_referencia: tipo_mensaje === "AUDIO" ? audio_url : null, // path de Storage
+     procesado_por_ia: false,
+     duracion_segundos: null,
+     tipo_mensaje_original: tipo_mensaje,
+     frase_introductoria: fraseIntroductoria,
+   }
+   ```
+
+5. **Respuesta HTTP actualizada:** El campo `audio_bytes_total` fue reemplazado por `despachos_mqtt` (1 para TEXTO, 2 para AUDIO) ya que ya no hay un único array de bytes final.
+
+**Decisiones de arquitectura relevantes:**
+- El delay de 3500ms es un valor fijo conservador. En el futuro puede hacerse dinámico usando la duración del audio de intro (si Polly la retorna) o mediante un ACK del hardware.
+- La descarga de Storage ocurre **después** del primer MQTT publish y el delay, no antes. Esto optimiza el tiempo total: mientras el hardware reproduce la intro, el backend ya está descargando la nota de voz.
+- `StorageNotFoundError` sigue activo para diferenciar el error de 404 de bucket de errores de red genéricos.
+
+---
+
+### Iteración 4 — Refactor orquestador_iot: AUDIO_DIRECTO Bypass + CONFIRMACION_ESCUCHA (2026-09-23)
+
+**Objetivo:** (1) Implementar el bypass completo para notas de voz del hardware (`tipo_evento === "AUDIO_DIRECTO"`) con Storage path interno, historial propio y early return. (2) Corregir el gatillo `CONFIRMACION_ESCUCHA` para que se active solo con la intención detectada por Gemini, sin requerir `destinatario_identificado`.
+
+**Archivos tocados:**
+- `supabase/functions/orquestador_iot/index.ts` — SECCIÓN 4 (CASO 2 y CASO 3).
+
+**Cambios específicos:**
+
+1. **CASO 2 — AUDIO_DIRECTO Bypass (reescritura completa):**
+   - **Antes:** Usaba `getPublicUrl()` (URL pública expuesta), `throw` bloqueante si fallaba el upload, caía a SECCIÓN 5-6 para el historial y el dispatch.
+   - **Ahora:**
+     - Path interno `mensajes/coco_audio_rx_${Date.now()}.wav` (no URL pública).
+     - Upload con `try/catch` no bloqueante: si falla, el hardware igual recibe su confirmación de audio.
+     - Insert propio en `historial_interacciones` con `metadata_payload: { url_audio_referencia: rutaStorage | null, procesado_por_ia: false }`.
+     - TTS: `"Tu mensaje fue enviado exitosamente."` → Polly → Base64.
+     - Dispatch MQTT propio con `AwsClient` + `service: "iotdata"` → `tipo_evento: "RESPUESTA_IA"`.
+     - **Early return** inmediato: no continúa a SECCIÓN 5-6.
+
+2. **CASO 3 — Gatillo CONFIRMACION_ESCUCHA (fix condición):**
+   - **Antes:** `if (classification.intencion_detectada === "AUDIO_DIRECTO" && classification.destinatario_identificado)` — el gatillo no se activaba si Gemini no identificaba un destinatario.
+   - **Ahora:** `if (classification.intencion_detectada === "AUDIO_DIRECTO")` — la intención sola es suficiente para abrir el micrófono.
+
+**Flujo actualizado del orquestador (SECCIÓN 4):**
+```
+tipo_evento === "ALERTA_SOS" + data === "EMERGENCIA_BOTON_PANICO"
+  → CASO 1: Bypass SOS → historial (en SECCIÓN 5) → MQTT → return 200
+
+tipo_evento === "AUDIO_DIRECTO" + formato === "AUDIO_B64"
+  → CASO 2: Bypass Storage → upload (no bloqueante) → historial propio → TTS confirmación → MQTT → EARLY RETURN ←
+
+formato === "AUDIO_B64" (flujo normal)
+  → CASO 3: Deepgram → Gemini → Polly
+    Si intencion === "AUDIO_DIRECTO": tipo_evento_bajada = "CONFIRMACION_ESCUCHA"
+    Si no: tipo_evento_bajada = "RESPUESTA_IA"
+  → historial (en SECCIÓN 5) → MQTT → return 200
+```
+
+**Decisiones de arquitectura relevantes:**
+- El upload de Storage en CASO 2 es no bloqueante porque la experiencia del hardware no debe depender de la disponibilidad del bucket. El hardware siempre recibe su `"Tu mensaje fue enviado exitosamente."`.
+- `url_audio_referencia` en `metadata_payload` del CASO 2 puede ser `null` si el upload falla, lo cual es intencionado y auditable.
+- El CASO 2 instancia su propio `AwsClient` (no reutiliza el de SECCIÓN 6) porque retorna early antes de llegar a esa sección. Las reglas SigV4 son idénticas.
+

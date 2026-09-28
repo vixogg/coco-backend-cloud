@@ -100,31 +100,115 @@ Deno.serve(async (req) => {
       resultadoIA.audio_respuesta_b64 = uint8ArrayToBase64(synthesizedAudio);
 
     } else if (tipo_evento === "AUDIO_DIRECTO" && formato_payload === "AUDIO_B64") {
-      // CASO 2: BYPASS Nota de Voz (Sube al Bucket audios_directos_coco)
-      console.log(`[STORAGE] Recibiendo nota de voz directa para MAC: ${mac_address}`);
-      
+      // CASO 2: BYPASS — Nota de Voz del hardware hacia la App.
+      // El abuelo ya grabó el audio. Subimos al bucket y notificamos sin pasar por IA.
+      console.log(`[BYPASS AUDIO_DIRECTO] Recibiendo nota de voz para MAC: ${mac_address}`);
+
+      // --- Subida al bucket 'audios_directos_coco' ---
       const audioBytes = decodeBase64ToUint8Array(data);
-      const fileName = `${mac_address}_${Date.now()}.wav`;
+      // Path con subcarpeta 'mensajes/' para separar notas de voz de otros assets.
+      // El path interno (no URL pública) es el que se guarda en historial para auditoría.
+      const rutaStorage = `mensajes/coco_audio_rx_${Date.now()}.wav`;
 
-      const { error: uploadError } = await supabase
-        .storage
-        .from('audios_directos_coco')
-        .upload(fileName, audioBytes, { contentType: 'audio/wav' });
+      let uploadOk = false;
+      try {
+        const { error: uploadError } = await supabase
+          .storage
+          .from("audios_directos_coco")
+          .upload(rutaStorage, audioBytes, { contentType: "audio/wav" });
 
-      if (uploadError) throw new Error(`Fallo al subir a Storage: ${uploadError.message}`);
+        if (uploadError) {
+          // Log descriptivo pero no bloqueante: el hardware igual recibe confirmación
+          console.error(`[STORAGE ERROR] Fallo al subir '${rutaStorage}': ${uploadError.message}`);
+        } else {
+          uploadOk = true;
+          console.log(`[STORAGE OK] Nota de voz guardada en: ${rutaStorage}`);
+        }
+      } catch (storageEx) {
+        const msg = storageEx instanceof Error ? storageEx.message : String(storageEx);
+        console.error(`[STORAGE EXCEPTION] ${msg}`);
+      }
 
-      const { data: publicUrlData } = supabase
-        .storage
-        .from('audios_directos_coco')
-        .getPublicUrl(fileName);
+      // --- Insertar en historial_interacciones (bypass propio, no cae a SECCIÓN 5) ---
+      const { error: errorInsertAudio } = await supabase
+        .from("historial_interacciones")
+        .insert({
+          dispositivo_id: dispositivo.id,
+          emisor: "COCO",
+          destinatario_id: null,
+          tipo_evento: "AUDIO_DIRECTO",
+          metadata_payload: {
+            url_audio_referencia: uploadOk ? rutaStorage : null,
+            texto_procesado: "🎤 Nota de voz entrante",
+            procesado_por_ia: false,
+          },
+          estado_reproduccion: "PENDIENTE",
+          prioridad: "NORMAL",
+        });
 
-      resultadoIA.intencion_detectada = "AUDIO_DIRECTO";
-      resultadoIA.texto_procesado = "🎤 Nota de voz entrante";
-      resultadoIA.url_storage = publicUrlData.publicUrl; // Guardamos la URL pública
-      resultadoIA.tipo_evento_bajada = "RESPUESTA_IA"; // Retorna a la normalidad el hardware
-      
-      const synthesizedAudio = await synthesizeSpeech("Audio enviado a tu familia exitosamente.");
-      resultadoIA.audio_respuesta_b64 = uint8ArrayToBase64(synthesizedAudio);
+      if (errorInsertAudio) {
+        // No lanzamos throw: el hardware debe recibir su confirmación de todas formas
+        console.error(`[BD ERROR] No se pudo insertar en historial: ${errorInsertAudio.message}`);
+      } else {
+        console.log(`[BD OK] AUDIO_DIRECTO registrado en historial_interacciones`);
+      }
+
+      // --- TTS de confirmación para el hardware ---
+      const synthesizedConfirmacion = await synthesizeSpeech("Tu mensaje fue enviado exitosamente.");
+      const audioConfirmacionB64 = uint8ArrayToBase64(synthesizedConfirmacion);
+
+      // --- Dispatch MQTT propio con SigV4 (early return) ---
+      // tipo_evento: "RESPUESTA_IA" para que el hardware vuelva a su estado normal de escucha
+      const rawEndpointBypass = Deno.env.get("AWS_IOT_ENDPOINT") || "";
+      const cleanEndpointBypass = rawEndpointBypass.replace(/^https?:\/\//, "");
+      const iotRegionBypass = Deno.env.get("AWS_IOT_REGION") ?? "us-east-2";
+      const iotAccessKeyBypass = Deno.env.get("AWS_IOT_ACCESS_KEY_ID") ?? "";
+      const iotSecretKeyBypass = Deno.env.get("AWS_IOT_SECRET_ACCESS_KEY") ?? "";
+
+      if (!cleanEndpointBypass || !iotAccessKeyBypass || !iotSecretKeyBypass) {
+        throw new Error("Faltan credenciales de AWS IoT Core en los secrets");
+      }
+
+      const awsClientBypass = new AwsClient({
+        accessKeyId: iotAccessKeyBypass,
+        secretAccessKey: iotSecretKeyBypass,
+        region: iotRegionBypass,
+        service: "iotdata", // CRÍTICO: "iotdata" — no cambiar
+      });
+
+      // NUNCA usar encodeURIComponent en el tópico — rompería el hash del canonical URI
+      const topicRxBypass = `coco/dispositivos/${mac_address}/rx`;
+      const publishUrlBypass = `https://${cleanEndpointBypass}/topics/${topicRxBypass}?qos=1`;
+      const payloadBypass = {
+        mac_address: mac_address,
+        tipo_evento: "RESPUESTA_IA",
+        formato_payload: "AUDIO_B64",
+        data: audioConfirmacionB64,
+        prioridad: "NORMAL",
+      };
+
+      const bodyStrBypass = JSON.stringify(payloadBypass);
+      console.log(`[IoT TX BYPASS] Enviando confirmación en tópico: ${topicRxBypass}`);
+
+      const iotResponseBypass = await awsClientBypass.fetch(publishUrlBypass, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: bodyStrBypass,
+      });
+
+      if (!iotResponseBypass.ok) {
+        const errTexto = await iotResponseBypass.text();
+        console.error(`[IoT TX ERROR BYPASS] Status: ${iotResponseBypass.status} | Body: ${errTexto}`);
+        throw new Error("No se pudo entregar la confirmación al dispositivo");
+      }
+
+      console.log(`[IoT TX OK BYPASS] Confirmación entregada. Bypass AUDIO_DIRECTO completo.`);
+      // EARLY RETURN: este caso no continúa a SECCIÓN 5-6
+      return new Response(
+        JSON.stringify({ success: true, message: "Nota de voz procesada y confirmación enviada al hardware." }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+
 
     } else if (formato_payload === "AUDIO_B64") {
       // CASO 3: FLUJO NORMAL Procesamiento de Voz con IA
@@ -141,10 +225,12 @@ Deno.serve(async (req) => {
       resultadoIA.prioridad_sugerida = classification.prioridad_sugerida;
       resultadoIA.audio_respuesta_b64 = uint8ArrayToBase64(synthesizedAudio);
 
-      // LA MAGIA DE LA OPCIÓN A: Si la IA detecta que el abuelo quiere enviar un mensaje directo (Nota de voz)
-      if (classification.intencion_detectada === "AUDIO_DIRECTO" && classification.destinatario_identificado) {
-        resultadoIA.tipo_evento_bajada = "CONFIRMACION_ESCUCHA"; // Gatillo para el simulador de Andrés
-        console.log(`[TRIGGER HARDWARE] Solicitando modo grabación a la placa mediante CONFIRMACION_ESCUCHA`);
+      // CONFIRMACION_ESCUCHA — Gatillo para que Andrés abra el micrófono.
+      // Se activa cuando Gemini detecta que el abuelo quiere enviar una nota de voz.
+      // No se requiere destinatario_identificado: la intención sola es suficiente.
+      if (classification.intencion_detectada === "AUDIO_DIRECTO") {
+        resultadoIA.tipo_evento_bajada = "CONFIRMACION_ESCUCHA";
+        console.log(`[TRIGGER HARDWARE] Intención AUDIO_DIRECTO detectada → forzando tipo_evento_bajada: CONFIRMACION_ESCUCHA`);
       }
     } else {
       return new Response(JSON.stringify({ error: "Combinación de payload no válida" }), { status: 400 });
