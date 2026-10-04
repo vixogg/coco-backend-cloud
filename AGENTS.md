@@ -10,7 +10,7 @@ COCO es un dispositivo IoT (altavoz inteligente con filosofía Zero-UI) diseñad
 *   **Vicente (Backend & Cloud - Nuestro Rol):** Orquestamos todo mediante Supabase Edge Functions (Deno). Conectamos la base de datos, manejamos la seguridad JWT/SigV4 y somos el puente de comunicación de todos los demás.
 *   **Andrés (Hardware & MQTT):** Desarrolla el dispositivo/simulador. Nos envía datos por el tópico `coco/simulador/tx` y nosotros le enviamos respuestas (audios/comandos) al tópico `coco/dispositivos/{mac_address}/rx` mediante el puente HTTPS de AWS IoT Core.
 *   **Martín (App Móvil React Native):** Desarrolla la app para la red de apoyo. Su app consumirá nuestras Edge Functions (como `app_mensajeria`) enviando peticiones REST para comunicarse con el abuelo.
-*   **Diego (Inteligencia Artificial):** Provee los microservicios (`services/`) para transcribir (Deepgram), razonar (Gemini/Claude) y hablar (AWS Polly). Nosotros consumimos sus servicios en nuestras funciones.
+*   **Diego (Inteligencia Artificial):** Provee los microservicios (`services/`) para transcribir (Deepgram), razonar (Gemini como primario + **Groq como respaldo automático**) y hablar (**ElevenLabs**, formato MP3 `audio/mpeg`). Nosotros consumimos sus servicios actualizados en nuestras funciones.
 
 ## 3. Arquitectura de Base de Datos Core
 - `adultos_mayores`: (PK: `id`, `nombre`, `fecha_nacimiento`).
@@ -50,9 +50,22 @@ export interface GeminiResponse {
 2.  **Audio AWS Polly:** El texto se convierte a TTS con Polly, retorna Uint8Array y debe convertirse a string Base64 puro antes de enviarse en el payload JSON.
 3.  **Seguridad App Móvil:** Las funciones consumidas por la app de Martín deben validar el token JWT del usuario emisor (`req.headers.get("Authorization")`).
 
+## 5.5. Stack Tecnológico de IA (Servicios de Diego)
+
+| Capa | Proveedor actual | Formato de salida | Variables de entorno clave |
+|---|---|---|---|
+| **STT** | Deepgram (`nova-2`) | texto | `DEEPGRAM_API_KEY`, `DEEPGRAM_LANGUAGE` |
+| **LLM Primario** | Google Gemini | JSON estructurado | `GEMINI_API_KEY`, `GEMINI_MODEL` |
+| **LLM Respaldo** | Groq (Chat Completions) | JSON estructurado | `GROQ_API_KEY`, `GROQ_MODEL` |
+| **TTS** | ElevenLabs (`eleven_v4_turbo`) | **MP3** (`audio/mpeg`) | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` |
+
+> **Nota de formato de audio:** ElevenLabs reemplazó a Amazon Polly como servicio TTS. Los audios ahora llegan en formato **MP3 (`audio/mpeg`, `mp3_44100_128`)**, no WAV. La interfaz `synthesizeSpeech(text): Promise<Uint8Array>` es idéntica a la anterior, por lo que los `index.ts` no requirieron cambios en sus llamadas. El Doble Despacho Secuencial de `app_mensajeria` y todos los bypass del `orquestador_iot` operan igual.
+
+> **Nota de fallback LLM:** Groq se activa automáticamente cuando Gemini falla por timeout, rate-limit (429), error de servidor (5xx) o respuesta JSON inválida. Errores de config, auth o modelo incorrecto **no** activan el fallback (son fatales). Ambos proveedores producen exactamente el mismo contrato `GeminiResponse`.
+
 ## 6. Estado Actual del Proyecto
-*   **[COMPLETADO] `orquestador_iot`:** Flujo de subida listo. Recibe MQTT (vía Webhook), procesa con IA, guarda en historial y devuelve audio al hardware.
-*   **[COMPLETADO] `app_mensajeria`:** Flujo de bajada completo. Recibe peticiones REST de la App de Martín, consulta BD para nombre del adulto mayor y rol/apodo del emisor, construye frase introductoria dinámica, sintetiza audio con Polly, concatena bytes si es AUDIO, persiste en historial e invoca AWS IoT Core con SigV4.
+*   **[COMPLETADO] `orquestador_iot`:** Flujo de subida listo. Recibe MQTT (vía Webhook), procesa con IA (Gemini + Groq fallback), guarda en historial y devuelve audio MP3 (ElevenLabs) al hardware.
+*   **[COMPLETADO] `app_mensajeria`:** Flujo de bajada completo. Recibe peticiones REST de la App de Martín, consulta BD para nombre del adulto mayor y rol/apodo del emisor, construye frase introductoria dinámica, sintetiza audio MP3 con ElevenLabs, aplica Doble Despacho MQTT si es AUDIO, persiste en historial e invoca AWS IoT Core con SigV4.
 *   **[PENDIENTE] `app_gestion`:** Endpoints para que Martín administre la red de apoyo.
 
 ## 7. Protocolo de Agentes IA (Instrucción Autónoma)
@@ -220,7 +233,7 @@ tipo_evento === "AUDIO_DIRECTO" + formato === "AUDIO_B64"
   → CASO 2: Bypass Storage → upload (no bloqueante) → historial propio → TTS confirmación → MQTT → EARLY RETURN ←
 
 formato === "AUDIO_B64" (flujo normal)
-  → CASO 3: Deepgram → Gemini → Polly
+  → CASO 3: Deepgram → Gemini (+ Groq fallback) → ElevenLabs
     Si intencion === "AUDIO_DIRECTO": tipo_evento_bajada = "CONFIRMACION_ESCUCHA"
     Si no: tipo_evento_bajada = "RESPUESTA_IA"
   → historial (en SECCIÓN 5) → MQTT → return 200
@@ -230,4 +243,59 @@ formato === "AUDIO_B64" (flujo normal)
 - El upload de Storage en CASO 2 es no bloqueante porque la experiencia del hardware no debe depender de la disponibilidad del bucket. El hardware siempre recibe su `"Tu mensaje fue enviado exitosamente."`.
 - `url_audio_referencia` en `metadata_payload` del CASO 2 puede ser `null` si el upload falla, lo cual es intencionado y auditable.
 - El CASO 2 instancia su propio `AwsClient` (no reutiliza el de SECCIÓN 6) porque retorna early antes de llegar a esa sección. Las reglas SigV4 son idénticas.
+
+---
+
+### Iteración 5 — Migración TTS a ElevenLabs + LLM Groq Fallback (2026-10-04)
+
+**Objetivo:** Integrar los microservicios actualizados de Diego: reemplazar Amazon Polly por ElevenLabs (TTS) e incorporar Groq como LLM de respaldo automático cuando Gemini falla.
+
+**Archivos tocados:**
+- `supabase/functions/orquestador_iot/services/ttsService.ts` — Reescritura completa: Polly (SigV4 manual ~258 líneas) → ElevenLabs REST (79 líneas).
+- `supabase/functions/app_mensajeria/services/ttsService.ts` — Ídem anterior (cada función Supabase es autónoma, no comparten módulos).
+- `supabase/functions/orquestador_iot/services/llmService.ts` — Reescritura completa: Gemini solo → Gemini primario + Groq fallback. Jerarquía de errores renombrada de `GeminiServiceError` → `LLMServiceError` (agnóstica al proveedor).
+- `supabase/functions/orquestador_iot/services/sttService.ts` — Sincronización con `services_new/` de Diego (sin cambios funcionales).
+- `AGENTS.md` — Sección 2 (equipo), nueva sección 5.5 (stack IA), sección 6 (estado) y log de iteración actualizados.
+
+**Fuentes de referencia:**
+- `supabase/functions/services_new/` — Carpeta con los nuevos archivos de Diego.
+- `README_diego.md` — Documentación oficial del nuevo stack.
+
+**Resultado del análisis de integración (Regla de Oro):**
+| Función pública | Firma antes | Firma después | ¿Cambió index.ts? |
+|---|---|---|---|
+| `synthesizeSpeech(text)` | `Promise<Uint8Array>` | `Promise<Uint8Array>` | **NO** |
+| `classifyTranscription(t, mac, tipo)` | `Promise<GeminiResponse>` | `Promise<GeminiResponse>` | **NO** |
+| `transcribeAudio(audio)` | `Promise<string>` | `Promise<string>` | **NO** |
+
+Los `index.ts` de `orquestador_iot` y `app_mensajeria` **no requirieron ninguna modificación**. Toda la lógica de negocio (Bypass AUDIO_DIRECTO, CONFIRMACION_ESCUCHA, Doble Despacho Secuencial 3.5s) quedó intacta.
+
+**Cambios internos relevantes en los nuevos servicios:**
+
+1. **ttsService.ts (ElevenLabs):**
+   - Autenticación: `xi-api-key` en header (no SigV4). Elimina todas las funciones de firma criptográfica.
+   - Endpoint: `https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?output_format=mp3_44100_128`.
+   - Formato de salida: **MP3 (`audio/mpeg`)** en lugar de WAV/MP3 de Polly.
+   - Variables de entorno nuevas: `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL_ID` (default: `eleven_v4_turbo`), `ELEVENLABS_TIMEOUT_MS`.
+   - Variables de entorno obsoletas (eliminar de secrets): `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `POLLY_VOICE_ID`, `POLLY_OUTPUT_FORMAT`, `POLLY_TIMEOUT_MS`.
+
+2. **llmService.ts (Gemini + Groq fallback):**
+   - `classifyTranscription()` intenta Gemini primero (con reintentos configurables).
+   - Si Gemini falla por timeout/rate-limit/5xx/JSON inválido → activa `callGroq()` como respaldo.
+   - Errores fatales (config, auth, modelo no encontrado, bad request) **no** activan el fallback.
+   - Groq usa la API OpenAI-compatible: `https://api.groq.com/openai/v1/chat/completions`.
+   - Variables de entorno nuevas: `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_TIMEOUT_MS`.
+   - System prompt mejorado: más explícito, con ejemplos detallados y reglas numeradas.
+   - Jerarquía de errores refactorizada (agnóstica al proveedor): `LLMServiceError` → `LLMError`, `LLMConfigError`, `LLMAuthError`, `LLMTimeoutError`, `LLMInvalidResponseError`, `LLMModelNotFoundError`, `LLMBadRequestError`.
+
+**Variables de entorno que deben agregarse a Supabase Secrets:**
+```
+ELEVENLABS_API_KEY=<tu_api_key>
+ELEVENLABS_VOICE_ID=<id_de_voz>
+ELEVENLABS_MODEL_ID=eleven_v4_turbo
+ELEVENLABS_TIMEOUT_MS=10000
+GROQ_API_KEY=<tu_api_key>
+GROQ_MODEL=<modelo_ej_llama-3.3-70b-versatile>
+GROQ_TIMEOUT_MS=10000
+```
 
