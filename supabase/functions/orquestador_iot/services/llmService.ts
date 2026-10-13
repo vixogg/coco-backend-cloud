@@ -487,7 +487,7 @@ async function callGemini(
           const remainingAfter = budget.remaining();
           const canRetry =
             attempt < maxAttempts &&
-            remainingAfter > retryDelayMs + budget.groqReserve + 500;
+            remainingAfter > retryDelayMs + 500;
           if (canRetry) {
             console.warn(`[gemini] Transient error ${status}. Retrying in ${retryDelayMs}ms... (${attempt}/${maxAttempts})`);
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
@@ -523,7 +523,7 @@ async function callGemini(
         const remainingAfter = budget.remaining();
         const canRetry =
           attempt < maxAttempts &&
-          remainingAfter > retryDelayMs + budget.groqReserve + 500;
+          remainingAfter > retryDelayMs + 500;
         if (canRetry) {
           await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
           continue;
@@ -545,31 +545,28 @@ async function callGemini(
 
 export interface LLMBudget {
   deadline: number;
-  groqReserve: number;
   remaining(): number;
   availableForGemini(): number;
-  canRunGroq(): boolean;
+  canRunGemini(): boolean;
   expired(): boolean;
 }
 
 function createBudget(): LLMBudget {
   const totalMs = parseInt(Deno.env.get("LLM_TOTAL_TIMEOUT_MS") ?? "18000", 10);
-  const groqReserve = parseInt(Deno.env.get("GROQ_TIMEOUT_MS") ?? "6000", 10);
 
   const start = performance.now();
   const deadline = start + totalMs;
 
   return {
     deadline,
-    groqReserve,
     remaining(): number {
       return Math.max(0, deadline - performance.now());
     },
     availableForGemini(): number {
-      return Math.max(0, this.remaining() - this.groqReserve);
+      return this.remaining();
     },
-    canRunGroq(): boolean {
-      return this.remaining() > this.groqReserve * 0.1;
+    canRunGemini(): boolean {
+      return this.remaining() > 1000;
     },
     expired(): boolean {
       return performance.now() >= deadline;
@@ -714,50 +711,50 @@ export async function classifyTranscription(
   const llmStart = performance.now();
 
   try {
-    const result = await callGemini(transcription, macAddress, tipoEvento, budget);
+    const result = await callGroq(transcription, macAddress, tipoEvento, budget);
     const durationMs = Math.round(performance.now() - llmStart);
-    console.log(`[llm] classifyTranscription completed | provider=gemini | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`);
+    console.log(`[llm] classifyTranscription completed | provider=groq | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`);
     return result;
-  } catch (geminiError) {
-    if (geminiError instanceof LLMServiceError) {
-      const errorName = geminiError.name;
+  } catch (groqError) {
+    if (groqError instanceof LLMServiceError) {
+      const errorName = groqError.name;
       const canFallback =
-        geminiError instanceof LLMTimeoutError ||
-        geminiError instanceof LLMInvalidResponseError ||
-        (geminiError instanceof LLMError &&
-          !(geminiError instanceof LLMConfigError) &&
-          !(geminiError instanceof LLMAuthError) &&
-          !(geminiError instanceof LLMModelNotFoundError) &&
-          !(geminiError instanceof LLMBadRequestError));
+        groqError instanceof LLMTimeoutError ||
+        groqError instanceof LLMInvalidResponseError ||
+        (groqError instanceof LLMError &&
+          !(groqError instanceof LLMConfigError) &&
+          !(groqError instanceof LLMAuthError) &&
+          !(groqError instanceof LLMModelNotFoundError) &&
+          !(groqError instanceof LLMBadRequestError));
 
-      if (canFallback && budget.canRunGroq()) {
-        const geminiDurationMs = Math.round(performance.now() - llmStart);
+      if (canFallback && budget.canRunGemini()) {
+        const groqDurationMs = Math.round(performance.now() - llmStart);
         console.error(
-          `[llm-fallback] Gemini failed (${errorName}) after ${geminiDurationMs}ms. Attempting Groq fallback with ${budget.remaining()}ms remaining...`
+          `[llm-fallback] Groq failed (${errorName}) after ${groqDurationMs}ms. Attempting Gemini fallback with ${budget.remaining()}ms remaining...`
         );
         try {
-          const result = await callGroq(transcription, macAddress, tipoEvento, budget);
+          const result = await callGemini(transcription, macAddress, tipoEvento, budget);
           const durationMs = Math.round(performance.now() - llmStart);
-          console.log(`[llm] classifyTranscription completed | provider=groq | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`);
+          console.log(`[llm] classifyTranscription completed | provider=gemini | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`);
           return result;
-        } catch (groqError) {
+        } catch (geminiError) {
           const durationMs = Math.round(performance.now() - llmStart);
           console.error(
-            `[llm-fallback] Groq also failed after ${durationMs}ms: ${groqError instanceof Error ? groqError.message : "unknown"}`
+            `[llm-fallback] Gemini also failed after ${durationMs}ms: ${geminiError instanceof Error ? geminiError.message : "unknown"}`
           );
-          throw groqError;
+          throw geminiError;
         }
       }
 
-      if (canFallback && !budget.canRunGroq()) {
+      if (canFallback && !budget.canRunGemini()) {
         const durationMs = Math.round(performance.now() - llmStart);
         console.error(
-          `[llm-fallback] Gemini failed (${errorName}) after ${durationMs}ms and budget is exhausted (remaining=${budget.remaining()}ms, groqReserve=${budget.groqReserve}ms). Cannot fallback to Groq.`
+          `[llm-fallback] Groq failed (${errorName}) after ${durationMs}ms and budget is exhausted (remaining=${budget.remaining()}ms). Cannot fallback to Gemini.`
         );
         throw new LLMTimeoutError("llm-total", budget.remaining());
       }
     }
-    throw geminiError;
+    throw groqError;
   }
 }
 

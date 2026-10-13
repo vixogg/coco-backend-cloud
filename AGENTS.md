@@ -55,8 +55,8 @@ export interface GeminiResponse {
 | Capa | Proveedor actual | Formato de salida | Variables de entorno clave |
 |---|---|---|---|
 | **STT** | Deepgram (`nova-2`) | texto | `DEEPGRAM_API_KEY`, `DEEPGRAM_LANGUAGE` |
-| **LLM Primario** | Google Gemini | JSON estructurado | `GEMINI_API_KEY`, `GEMINI_MODEL` |
-| **LLM Respaldo** | Groq (Chat Completions) | JSON estructurado | `GROQ_API_KEY`, `GROQ_MODEL` |
+| **LLM Primario** | Groq (Chat Completions) | JSON estructurado | `GROQ_API_KEY`, `GROQ_MODEL` |
+| **LLM Respaldo** | Google Gemini | JSON estructurado | `GEMINI_API_KEY`, `GEMINI_MODEL` |
 | **TTS** | ElevenLabs (`eleven_v4_turbo`) | **MP3** (`audio/mpeg`) | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` |
 
 > **Nota de formato de audio:** ElevenLabs reemplazó a Amazon Polly como servicio TTS. Los audios ahora llegan en formato **MP3 (`audio/mpeg`, `mp3_44100_128`)**, no WAV. La interfaz `synthesizeSpeech(text): Promise<Uint8Array>` es idéntica a la anterior, por lo que los `index.ts` no requirieron cambios en sus llamadas. El Doble Despacho Secuencial de `app_mensajeria` y todos los bypass del `orquestador_iot` operan igual.
@@ -64,7 +64,7 @@ export interface GeminiResponse {
 > **Nota de fallback LLM:** Groq se activa automáticamente cuando Gemini falla por timeout, rate-limit (429), error de servidor (5xx) o respuesta JSON inválida. Errores de config, auth o modelo incorrecto **no** activan el fallback (son fatales). Ambos proveedores producen exactamente el mismo contrato `GeminiResponse`.
 
 ## 6. Estado Actual del Proyecto
-*   **[COMPLETADO] `orquestador_iot`:** Flujo de subida listo. Recibe MQTT (vía Webhook), procesa con IA (Gemini + Groq fallback), guarda en historial y devuelve audio MP3 (ElevenLabs) al hardware.
+*   **[COMPLETADO] `orquestador_iot`:** Flujo de subida listo. Recibe MQTT (vía Webhook), procesa con IA (Groq primario + Gemini fallback), guarda en historial y devuelve audio MP3 (ElevenLabs) al hardware.
 *   **[COMPLETADO] `app_mensajeria`:** Flujo de bajada completo. Recibe peticiones REST de la App de Martín, consulta BD para nombre del adulto mayor y rol/apodo del emisor, construye frase introductoria dinámica, sintetiza audio MP3 con ElevenLabs, aplica Doble Despacho MQTT si es AUDIO, persiste en historial e invoca AWS IoT Core con SigV4.
 *   **[PENDIENTE] `app_gestion`:** Endpoints para que Martín administre la red de apoyo.
 
@@ -337,3 +337,19 @@ GROQ_TIMEOUT_MS=10000
 **Variables de entorno:**
 - LLM_TOTAL_TIMEOUT_MS es la unica variable nueva. Default 18000ms cubre el caso comun sin configuracion adicional.
 - NO se requiere supabase secrets set para que la actualizacion tome efecto. Solo redesplegar el codigo.
+
+---
+
+### Iteracion 7 - Inversion a Groq Primario + Gemini Fallback (2026-10-13)
+
+**Objetivo:** Eliminar los picos de latencia (>12s), timeouts de Gemini y errores HTTP 503 ('high demand'), los cuales provocaban que AWS IoT Core reintentara 3 veces el webhook y el parlante repitiera el mensaje 3 veces.
+
+**Archivos tocados:**
+- `supabase/functions/orquestador_iot/services/llmService.ts` - Inversion del flujo en `classifyTranscription`: Groq se ejecuta como LLM primario (~300-700ms) y Gemini pasa a ser fallback secundario. Ajuste de `LLMBudget` (`canRunGemini`, `availableForGemini`) y condicion de reintento de Gemini.
+- `AGENTS.md` - Actualizacion de tabla de stack IA, estado actual del proyecto y log de iteracion.
+
+**Cambios clave:**
+1. **Groq Primario:** `callGroq` se invoca primero en `classifyTranscription`. La inferencia en hardware LPU toma tipicamente menos de 1 segundo.
+2. **Gemini Fallback:** Si Groq falla por timeout o error recuperable, se activa `callGemini` con el tiempo restante del presupuesto.
+3. **Erradicacion de retries en AWS IoT Core:** Al responder el Edge Function en ~2.5s en total (STT Deepgram ~1s + Groq ~0.5s + ElevenLabs ~1s), AWS IoT Core recibe `HTTP 200 OK` de inmediato y no reintenta. Cero repeticiones en el hardware de Andres.
+4. **Contrato intacto:** La firma publica `classifyTranscription(transcription, macAddress, tipoEvento): Promise<GeminiResponse>` se mantiene identica.

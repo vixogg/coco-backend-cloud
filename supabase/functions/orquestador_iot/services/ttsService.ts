@@ -9,7 +9,7 @@ export async function synthesizeSpeech(text: string): Promise<Uint8Array> {
   if (!apiKey) throw new TTSServiceError("ELEVENLABS_API_KEY is not configured");
   if (!voiceId) throw new TTSServiceError("ELEVENLABS_VOICE_ID is not configured");
 
-  const url = `${ELEVENLABS_API_BASE}/text-to-speech/${voiceId}?output_format=mp3_44100_128`;
+  const url = `${ELEVENLABS_API_BASE}/text-to-speech/${voiceId}?output_format=mp3_22050_32`;
 
   const body = JSON.stringify({
     text,
