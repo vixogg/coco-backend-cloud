@@ -411,14 +411,15 @@ function extractTextFromGeminiResponse(result: unknown): string {
 async function callGemini(
   transcription: string,
   macAddress: string,
-  tipoEvento: TipoEvento
+  tipoEvento: TipoEvento,
+  budget: LLMBudget
 ): Promise<GeminiResponse> {
   const apiKey = getGeminiApiKey();
   const model = getGeminiModel();
   const apiVersion = getGeminiApiVersion();
-  const timeoutMs = parseInt(Deno.env.get("GEMINI_TIMEOUT_MS") ?? "45000", 10);
-  const maxRetries = parseInt(Deno.env.get("GEMINI_MAX_RETRIES") ?? "3", 10);
-  const retryDelayMs = parseInt(Deno.env.get("GEMINI_RETRY_DELAY_MS") ?? "2000", 10);
+  const timeoutMs = parseInt(Deno.env.get("GEMINI_TIMEOUT_MS") ?? "10000", 10);
+  const maxAttempts = parseInt(Deno.env.get("GEMINI_MAX_RETRIES") ?? "2", 10);
+  const retryDelayMs = parseInt(Deno.env.get("GEMINI_RETRY_DELAY_MS") ?? "100", 10);
 
   const userMessage = buildUserMessage(transcription, macAddress, tipoEvento);
 
@@ -439,12 +440,20 @@ async function callGemini(
 
   let lastError: Error = new LLMError("No attempts performed");
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const available = budget.availableForGemini();
+    if (available <= 0) {
+      console.warn(`[gemini] Budget exhausted (no time for Gemini after Groq reserve). Aborting before attempt ${attempt}/${maxAttempts}.`);
+      throw new LLMTimeoutError("gemini", 0);
+    }
+
+    const effectiveTimeout = Math.min(timeoutMs, available);
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+    const attemptStart = performance.now();
 
     try {
-      console.log(`[gemini] Attempt ${attempt}/${maxRetries} | model=${model} | timeout=${timeoutMs}ms`);
+      console.log(`[gemini] Attempt ${attempt}/${maxAttempts} | model=${model} | timeout=${effectiveTimeout}ms | budgetRemaining=${budget.remaining()}ms | geminiAvailable=${available}ms`);
 
       const response = await fetch(url, {
         method: "POST",
@@ -460,9 +469,10 @@ async function callGemini(
         const status = response.status;
         const message = err?.message ?? "unknown";
         const errorCode = err?.status ?? "UNKNOWN";
+        const durationMs = Math.round(performance.now() - attemptStart);
 
         console.error(
-          `[gemini] HTTP ${status} (${errorCode}) | attempt=${attempt}/${maxRetries} | model=${model} | apiVersion=${apiVersion} | message=${message} | body=${truncate(errorBody, 500)}`
+          `[gemini] HTTP ${status} (${errorCode}) | attempt=${attempt}/${maxAttempts} | durationMs=${durationMs} | model=${model} | message=${message} | body=${truncate(errorBody, 500)}`
         );
 
         if (status === 404) {
@@ -474,8 +484,12 @@ async function callGemini(
 
         if (status === 503 || status === 429) {
           lastError = new LLMError(`Gemini HTTP ${status} (${errorCode}): ${message}`);
-          if (attempt < maxRetries) {
-            console.warn(`[gemini] Transient error ${status}. Retrying in ${retryDelayMs}ms... (${attempt}/${maxRetries})`);
+          const remainingAfter = budget.remaining();
+          const canRetry =
+            attempt < maxAttempts &&
+            remainingAfter > retryDelayMs + budget.groqReserve + 500;
+          if (canRetry) {
+            console.warn(`[gemini] Transient error ${status}. Retrying in ${retryDelayMs}ms... (${attempt}/${maxAttempts})`);
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
             continue;
           }
@@ -495,19 +509,22 @@ async function callGemini(
       }
 
       const validated = validateLLMResponse(parsed, tipoEvento);
-
-      if (attempt > 1) {
-        console.log(`[gemini] Success on attempt ${attempt}/${maxRetries}.`);
-      }
+      const durationMs = Math.round(performance.now() - attemptStart);
+      console.log(`[gemini] Success | attempt=${attempt}/${maxAttempts} | durationMs=${durationMs} | provider=gemini | result=ok`);
       return validated;
 
     } catch (error) {
       clearTimeout(timeoutId);
+      const durationMs = Math.round(performance.now() - attemptStart);
       if (error instanceof LLMServiceError) throw error;
       if (error instanceof DOMException && error.name === "AbortError") {
-        lastError = new LLMTimeoutError("gemini", timeoutMs);
-        console.warn(`[gemini] Timeout (${timeoutMs}ms) on attempt ${attempt}/${maxRetries}.`);
-        if (attempt < maxRetries) {
+        lastError = new LLMTimeoutError("gemini", effectiveTimeout);
+        console.warn(`[gemini] Timeout (${effectiveTimeout}ms) on attempt ${attempt}/${maxAttempts} | durationMs=${durationMs}`);
+        const remainingAfter = budget.remaining();
+        const canRetry =
+          attempt < maxAttempts &&
+          remainingAfter > retryDelayMs + budget.groqReserve + 500;
+        if (canRetry) {
           await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
           continue;
         }
@@ -522,6 +539,42 @@ async function callGemini(
   }
 
   throw lastError;
+}
+
+// ── Budget ────────────────────────────────────────────────────────────────────
+
+export interface LLMBudget {
+  deadline: number;
+  groqReserve: number;
+  remaining(): number;
+  availableForGemini(): number;
+  canRunGroq(): boolean;
+  expired(): boolean;
+}
+
+function createBudget(): LLMBudget {
+  const totalMs = parseInt(Deno.env.get("LLM_TOTAL_TIMEOUT_MS") ?? "18000", 10);
+  const groqReserve = parseInt(Deno.env.get("GROQ_TIMEOUT_MS") ?? "6000", 10);
+
+  const start = performance.now();
+  const deadline = start + totalMs;
+
+  return {
+    deadline,
+    groqReserve,
+    remaining(): number {
+      return Math.max(0, deadline - performance.now());
+    },
+    availableForGemini(): number {
+      return Math.max(0, this.remaining() - this.groqReserve);
+    },
+    canRunGroq(): boolean {
+      return this.remaining() > this.groqReserve * 0.1;
+    },
+    expired(): boolean {
+      return performance.now() >= deadline;
+    },
+  };
 }
 
 // ── Groq ──────────────────────────────────────────────────────────────────────
@@ -541,17 +594,25 @@ function getGroqModel(): string {
   if (!raw) {
     throw new LLMConfigError("GROQ_MODEL is not configured");
   }
-  return raw.trim().replace(/^['\"]+|['\"]+$/g, "");
+  return raw.trim().replace(/^['"]+|['"]+$/g, "");
 }
 
 async function callGroq(
   transcription: string,
   macAddress: string,
-  tipoEvento: TipoEvento
+  tipoEvento: TipoEvento,
+  budget: LLMBudget
 ): Promise<GeminiResponse> {
   const apiKey = getGroqApiKey();
   const model = getGroqModel();
-  const timeoutMs = parseInt(Deno.env.get("GROQ_TIMEOUT_MS") ?? "10000", 10);
+  const configuredTimeoutMs = parseInt(Deno.env.get("GROQ_TIMEOUT_MS") ?? "6000", 10);
+
+  const remainingBudget = budget.remaining();
+  const effectiveTimeout = Math.min(configuredTimeoutMs, remainingBudget);
+
+  if (effectiveTimeout <= 0) {
+    throw new LLMTimeoutError("groq", 0);
+  }
 
   const userMessage = buildUserMessage(transcription, macAddress, tipoEvento);
 
@@ -566,10 +627,11 @@ async function callGroq(
   };
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+  const attemptStart = performance.now();
 
   try {
-    console.log(`[groq] Attempting classification | model=${model} | timeout=${timeoutMs}ms`);
+    console.log(`[groq] Attempting classification | model=${model} | timeout=${effectiveTimeout}ms | budgetRemaining=${remainingBudget}ms`);
 
     const response = await fetch(GROQ_API_URL, {
       method: "POST",
@@ -587,9 +649,10 @@ async function callGroq(
       const err = parsed.error as { message?: string; type?: string } | undefined;
       const status = response.status;
       const message = err?.message ?? "unknown";
+      const durationMs = Math.round(performance.now() - attemptStart);
 
       console.error(
-        `[groq] HTTP ${status} | model=${model} | message=${message} | body=${truncate(errorBody, 500)}`
+        `[groq] HTTP ${status} | model=${model} | durationMs=${durationMs} | message=${message} | body=${truncate(errorBody, 500)}`
       );
 
       if (status === 404) {
@@ -626,9 +689,11 @@ async function callGroq(
 
     return validateLLMResponse(parsed, tipoEvento);
   } catch (error) {
+    const durationMs = Math.round(performance.now() - attemptStart);
     if (error instanceof LLMServiceError) throw error;
     if (error instanceof DOMException && error.name === "AbortError") {
-      throw new LLMTimeoutError("groq", timeoutMs);
+      console.warn(`[groq] Timeout (${effectiveTimeout}ms) | durationMs=${durationMs}`);
+      throw new LLMTimeoutError("groq", effectiveTimeout);
     }
     throw new LLMError(
       `Groq request failed: ${error instanceof Error ? error.message : "unknown error"}`
@@ -645,8 +710,14 @@ export async function classifyTranscription(
   macAddress: string,
   tipoEvento: TipoEvento
 ): Promise<GeminiResponse> {
+  const budget = createBudget();
+  const llmStart = performance.now();
+
   try {
-    return await callGemini(transcription, macAddress, tipoEvento);
+    const result = await callGemini(transcription, macAddress, tipoEvento, budget);
+    const durationMs = Math.round(performance.now() - llmStart);
+    console.log(`[llm] classifyTranscription completed | provider=gemini | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`);
+    return result;
   } catch (geminiError) {
     if (geminiError instanceof LLMServiceError) {
       const errorName = geminiError.name;
@@ -659,18 +730,31 @@ export async function classifyTranscription(
           !(geminiError instanceof LLMModelNotFoundError) &&
           !(geminiError instanceof LLMBadRequestError));
 
-      if (canFallback) {
+      if (canFallback && budget.canRunGroq()) {
+        const geminiDurationMs = Math.round(performance.now() - llmStart);
         console.error(
-          `[llm-fallback] Gemini failed (${errorName}). Attempting Groq fallback...`
+          `[llm-fallback] Gemini failed (${errorName}) after ${geminiDurationMs}ms. Attempting Groq fallback with ${budget.remaining()}ms remaining...`
         );
         try {
-          return await callGroq(transcription, macAddress, tipoEvento);
+          const result = await callGroq(transcription, macAddress, tipoEvento, budget);
+          const durationMs = Math.round(performance.now() - llmStart);
+          console.log(`[llm] classifyTranscription completed | provider=groq | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`);
+          return result;
         } catch (groqError) {
+          const durationMs = Math.round(performance.now() - llmStart);
           console.error(
-            `[llm-fallback] Groq also failed: ${groqError instanceof Error ? groqError.message : "unknown"}`
+            `[llm-fallback] Groq also failed after ${durationMs}ms: ${groqError instanceof Error ? groqError.message : "unknown"}`
           );
           throw groqError;
         }
+      }
+
+      if (canFallback && !budget.canRunGroq()) {
+        const durationMs = Math.round(performance.now() - llmStart);
+        console.error(
+          `[llm-fallback] Gemini failed (${errorName}) after ${durationMs}ms and budget is exhausted (remaining=${budget.remaining()}ms, groqReserve=${budget.groqReserve}ms). Cannot fallback to Groq.`
+        );
+        throw new LLMTimeoutError("llm-total", budget.remaining());
       }
     }
     throw geminiError;

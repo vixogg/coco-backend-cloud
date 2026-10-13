@@ -298,4 +298,42 @@ GROQ_API_KEY=<tu_api_key>
 GROQ_MODEL=<modelo_ej_llama-3.3-70b-versatile>
 GROQ_TIMEOUT_MS=10000
 ```
-
+
+---
+
+### Iteracion 6 - Optimizacion de Latencia LLM: Budget System (2026-10-13)
+
+**Objetivo:** Integrar la actualizacion de latencia entregada por Diego (llmservice_new.ts). Reducir el tiempo de espera total del pipeline LLM y garantizar que el fallback a Groq nunca se ejecute con tiempo insuficiente.
+
+**Archivos tocados:**
+- supabase/functions/orquestador_iot/services/llmService.ts — 3 bloques modificados quirurgicamente (callGemini, callGroq, classifyTranscription) + nueva seccion LLMBudget insertada.
+- llmservice_new.ts (raiz) — Archivo de entrega de Diego; queda como referencia historica.
+
+**Cambios exactos para reducir latencia:**
+
+| Parametro | Antes (v5) | Ahora (v6) | Variable de entorno |
+|---|---|---|---|
+| Timeout Gemini | 45000ms (default) | 10000ms (default) | GEMINI_TIMEOUT_MS |
+| Max. reintentos Gemini | 3 (default) | 2 (default) | GEMINI_MAX_RETRIES |
+| Delay entre reintentos | 2000ms (default) | 100ms (default) | GEMINI_RETRY_DELAY_MS |
+| Timeout Groq | 10000ms (default) | 6000ms (default) | GROQ_TIMEOUT_MS |
+| Presupuesto total | No existia | 18000ms (default) | LLM_TOTAL_TIMEOUT_MS (nueva) |
+
+**Nuevo mecanismo LLMBudget:**
+- classifyTranscription() crea un presupuesto de tiempo al inicio: LLM_TOTAL_TIMEOUT_MS (default 18 s).
+- El presupuesto se divide: Gemini puede usar todo el tiempo menos la reserva de Groq (GROQ_TIMEOUT_MS).
+- callGemini() recibe el budget y aplica effectiveTimeout = Math.min(GEMINI_TIMEOUT_MS, budget.availableForGemini()).
+- callGroq() recibe el budget y aplica effectiveTimeout = Math.min(GROQ_TIMEOUT_MS, budget.remaining()).
+- Si Gemini falla y el budget no tiene tiempo para Groq (canRunGroq() = false), lanza LLMTimeoutError("llm-total").
+- La condicion de reintento requiere ademas remainingBudget > retryDelayMs + groqReserve + 500ms.
+
+**Telemetria anadida:** durationMs real en cada intento de Gemini/Groq; provider y budgetRemaining al completar.
+
+**Contrato de datos: INTACTO**
+- Firma publica classifyTranscription(transcription, macAddress, tipoEvento): Promise<GeminiResponse> -> sin cambios.
+- Fallback a Groq -> sigue activo, ahora budget-aware.
+- index.ts del orquestador (bypass AUDIO_DIRECTO, CONFIRMACION_ESCUCHA) -> no tocado.
+
+**Variables de entorno:**
+- LLM_TOTAL_TIMEOUT_MS es la unica variable nueva. Default 18000ms cubre el caso comun sin configuracion adicional.
+- NO se requiere supabase secrets set para que la actualizacion tome efecto. Solo redesplegar el codigo.
