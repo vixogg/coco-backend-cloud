@@ -13,7 +13,8 @@ const VALID_INTENCIONES: IntencionDetectada[] = [
 ];
 const VALID_PRIORIDADES: PrioridadSugerida[] = ["NORMAL", "URGENTE"];
 
-const SYSTEM_PROMPT = `Eres el asistente de voz de COCO, un dispositivo IoT de hardware (altavoz inteligente) orientado a adultos mayores en Chile. Tu rol es procesar los mensajes que el adulto mayor envía a través de COCO y generar respuestas apropiadas.
+const SYSTEM_PROMPT =
+  `Eres el asistente de voz de COCO, un dispositivo IoT de hardware (altavoz inteligente) orientado a adultos mayores en Chile. Tu rol es procesar los mensajes que el adulto mayor envía a través de COCO y generar respuestas apropiadas.
 
 ═══════════════════════════════════════════════════════
 REGLAS GENERALES
@@ -146,7 +147,7 @@ const RESPONSE_SCHEMA = {
 
 export function validateLLMResponse(
   raw: unknown,
-  tipoEvento: TipoEvento
+  tipoEvento: TipoEvento,
 ): GeminiResponse {
   if (typeof raw !== "object" || raw === null) {
     throw new LLMInvalidResponseError("LLM response is not an object");
@@ -156,22 +157,22 @@ export function validateLLMResponse(
 
   if (!("intencion_detectada" in obj)) {
     throw new LLMInvalidResponseError(
-      "LLM response missing 'intencion_detectada'"
+      "LLM response missing 'intencion_detectada'",
     );
   }
   if (!("destinatario_identificado" in obj)) {
     throw new LLMInvalidResponseError(
-      "LLM response missing 'destinatario_identificado'"
+      "LLM response missing 'destinatario_identificado'",
     );
   }
   if (!("prioridad_sugerida" in obj)) {
     throw new LLMInvalidResponseError(
-      "LLM response missing 'prioridad_sugerida'"
+      "LLM response missing 'prioridad_sugerida'",
     );
   }
   if (!("respuesta_sintetizada" in obj)) {
     throw new LLMInvalidResponseError(
-      "LLM response missing 'respuesta_sintetizada'"
+      "LLM response missing 'respuesta_sintetizada'",
     );
   }
 
@@ -180,22 +181,26 @@ export function validateLLMResponse(
       k !== "intencion_detectada" &&
       k !== "destinatario_identificado" &&
       k !== "prioridad_sugerida" &&
-      k !== "respuesta_sintetizada"
+      k !== "respuesta_sintetizada",
   );
   if (unexpectedKeys.length > 0) {
     throw new LLMInvalidResponseError(
-      `LLM response contains unexpected fields: ${unexpectedKeys.join(", ")}`
+      `LLM response contains unexpected fields: ${unexpectedKeys.join(", ")}`,
     );
   }
 
-  if (!VALID_INTENCIONES.includes(obj.intencion_detectada as IntencionDetectada)) {
+  if (
+    !VALID_INTENCIONES.includes(obj.intencion_detectada as IntencionDetectada)
+  ) {
     throw new LLMInvalidResponseError(
-      `Invalid intencion_detectada: ${obj.intencion_detectada}`
+      `Invalid intencion_detectada: ${obj.intencion_detectada}`,
     );
   }
-  if (!VALID_PRIORIDADES.includes(obj.prioridad_sugerida as PrioridadSugerida)) {
+  if (
+    !VALID_PRIORIDADES.includes(obj.prioridad_sugerida as PrioridadSugerida)
+  ) {
     throw new LLMInvalidResponseError(
-      `Invalid prioridad_sugerida: ${obj.prioridad_sugerida}`
+      `Invalid prioridad_sugerida: ${obj.prioridad_sugerida}`,
     );
   }
   if (
@@ -203,29 +208,31 @@ export function validateLLMResponse(
     typeof obj.destinatario_identificado !== "string"
   ) {
     throw new LLMInvalidResponseError(
-      `destinatario_identificado must be string or null, got ${typeof obj.destinatario_identificado}`
+      `destinatario_identificado must be string or null, got ${typeof obj
+        .destinatario_identificado}`,
     );
   }
   if (typeof obj.respuesta_sintetizada !== "string") {
     throw new LLMInvalidResponseError(
-      `respuesta_sintetizada must be a string, got ${typeof obj.respuesta_sintetizada}`
+      `respuesta_sintetizada must be a string, got ${typeof obj
+        .respuesta_sintetizada}`,
     );
   }
   if ((obj.respuesta_sintetizada as string).trim().length === 0) {
     throw new LLMInvalidResponseError(
-      "respuesta_sintetizada must not be empty"
+      "respuesta_sintetizada must not be empty",
     );
   }
 
   if (tipoEvento === "ALERTA_SOS") {
     if (obj.intencion_detectada !== "ALERTA_SOS") {
       throw new LLMInvalidResponseError(
-        `ALERTA_SOS event forced intencion_detectada to ALERTA_SOS, got ${obj.intencion_detectada}`
+        `ALERTA_SOS event forced intencion_detectada to ALERTA_SOS, got ${obj.intencion_detectada}`,
       );
     }
     if (obj.prioridad_sugerida !== "URGENTE") {
       throw new LLMInvalidResponseError(
-        `ALERTA_SOS event forced prioridad_sugerida to URGENTE, got ${obj.prioridad_sugerida}`
+        `ALERTA_SOS event forced prioridad_sugerida to URGENTE, got ${obj.prioridad_sugerida}`,
       );
     }
   }
@@ -241,7 +248,7 @@ export function validateLLMResponse(
 function buildUserMessage(
   transcription: string,
   macAddress: string,
-  tipoEvento: TipoEvento
+  tipoEvento: TipoEvento,
 ): string {
   const parts = [
     `Transcripción del audio: "${transcription}"`,
@@ -251,7 +258,7 @@ function buildUserMessage(
 
   if (tipoEvento === "ALERTA_SOS") {
     parts.push(
-      "IMPORTANTE: Este evento es una ALERTA SOS. La intencion_detectada debe ser ALERTA_SOS y la prioridad_sugerida debe ser URGENTE. No degradar esta alerta a otro tipo."
+      "IMPORTANTE: Este evento es una ALERTA SOS. La intencion_detectada debe ser ALERTA_SOS y la prioridad_sugerida debe ser URGENTE. No degradar esta alerta a otro tipo.",
     );
   }
 
@@ -304,7 +311,7 @@ function buildGeminiUrl(
   apiVersion: string,
   model: string,
   action: string,
-  apiKey: string
+  apiKey: string,
 ): string {
   return `https://generativelanguage.googleapis.com/${apiVersion}/models/${model}:${action}?key=${apiKey}`;
 }
@@ -314,7 +321,8 @@ export async function diagnoseGeminiModels(): Promise<string[]> {
   const apiVersion = getGeminiApiVersion();
   const timeoutMs = parseInt(Deno.env.get("GEMINI_TIMEOUT_MS") ?? "10000", 10);
 
-  const url = `https://generativelanguage.googleapis.com/${apiVersion}/models?key=${apiKey}`;
+  const url =
+    `https://generativelanguage.googleapis.com/${apiVersion}/models?key=${apiKey}`;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -330,7 +338,9 @@ export async function diagnoseGeminiModels(): Promise<string[]> {
       const parsed = parseJSONBody(errorBody);
       const err = parsed.error as { message?: string } | undefined;
       console.error(
-        `[gemini-diag] Failed to list models: HTTP ${response.status} - ${err?.message ?? "unknown"}`
+        `[gemini-diag] Failed to list models: HTTP ${response.status} - ${
+          err?.message ?? "unknown"
+        }`,
       );
       return [];
     }
@@ -350,7 +360,9 @@ export async function diagnoseGeminiModels(): Promise<string[]> {
       .filter((m) => m.supportedGenerationMethods?.includes("generateContent"))
       .map((m) => m.name.replace(/^models\//, ""));
 
-    console.error(`[gemini-diag] Available models (${generateContentModels.length}):`);
+    console.error(
+      `[gemini-diag] Available models (${generateContentModels.length}):`,
+    );
     for (const name of generateContentModels) {
       console.error(`[gemini-diag]   - ${name}`);
     }
@@ -359,11 +371,11 @@ export async function diagnoseGeminiModels(): Promise<string[]> {
     const exactMatch = generateContentModels.includes(configured);
     if (!exactMatch) {
       console.error(
-        `[gemini-diag] WARNING: Configured model "${configured}" NOT found in available models.`
+        `[gemini-diag] WARNING: Configured model "${configured}" NOT found in available models.`,
       );
     } else {
       console.error(
-        `[gemini-diag] Configured model "${configured}" is available.`
+        `[gemini-diag] Configured model "${configured}" is available.`,
       );
     }
 
@@ -373,7 +385,9 @@ export async function diagnoseGeminiModels(): Promise<string[]> {
       console.error("[gemini-diag] Timeout listing models");
     } else {
       console.error(
-        `[gemini-diag] Error listing models: ${error instanceof Error ? error.message : "unknown"}`
+        `[gemini-diag] Error listing models: ${
+          error instanceof Error ? error.message : "unknown"
+        }`,
       );
     }
     return [];
@@ -412,14 +426,17 @@ async function callGemini(
   transcription: string,
   macAddress: string,
   tipoEvento: TipoEvento,
-  budget: LLMBudget
+  budget: LLMBudget,
 ): Promise<GeminiResponse> {
   const apiKey = getGeminiApiKey();
   const model = getGeminiModel();
   const apiVersion = getGeminiApiVersion();
   const timeoutMs = parseInt(Deno.env.get("GEMINI_TIMEOUT_MS") ?? "10000", 10);
   const maxAttempts = parseInt(Deno.env.get("GEMINI_MAX_RETRIES") ?? "2", 10);
-  const retryDelayMs = parseInt(Deno.env.get("GEMINI_RETRY_DELAY_MS") ?? "100", 10);
+  const retryDelayMs = parseInt(
+    Deno.env.get("GEMINI_RETRY_DELAY_MS") ?? "100",
+    10,
+  );
 
   const userMessage = buildUserMessage(transcription, macAddress, tipoEvento);
 
@@ -443,7 +460,9 @@ async function callGemini(
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const available = budget.availableForGemini();
     if (available <= 0) {
-      console.warn(`[gemini] Budget exhausted (no time for Gemini after Groq reserve). Aborting before attempt ${attempt}/${maxAttempts}.`);
+      console.warn(
+        `[gemini] Budget exhausted (no time for Gemini after Groq reserve). Aborting before attempt ${attempt}/${maxAttempts}.`,
+      );
       throw new LLMTimeoutError("gemini", 0);
     }
 
@@ -453,7 +472,9 @@ async function callGemini(
     const attemptStart = performance.now();
 
     try {
-      console.log(`[gemini] Attempt ${attempt}/${maxAttempts} | model=${model} | timeout=${effectiveTimeout}ms | budgetRemaining=${budget.remaining()}ms | geminiAvailable=${available}ms`);
+      console.log(
+        `[gemini] Attempt ${attempt}/${maxAttempts} | model=${model} | timeout=${effectiveTimeout}ms | budgetRemaining=${budget.remaining()}ms | geminiAvailable=${available}ms`,
+      );
 
       const response = await fetch(url, {
         method: "POST",
@@ -465,31 +486,45 @@ async function callGemini(
       if (!response.ok) {
         const errorBody = await response.text();
         const parsed = parseJSONBody(errorBody);
-        const err = parsed.error as { message?: string; status?: string } | undefined;
+        const err = parsed.error as
+          | { message?: string; status?: string }
+          | undefined;
         const status = response.status;
         const message = err?.message ?? "unknown";
         const errorCode = err?.status ?? "UNKNOWN";
         const durationMs = Math.round(performance.now() - attemptStart);
 
         console.error(
-          `[gemini] HTTP ${status} (${errorCode}) | attempt=${attempt}/${maxAttempts} | durationMs=${durationMs} | model=${model} | message=${message} | body=${truncate(errorBody, 500)}`
+          `[gemini] HTTP ${status} (${errorCode}) | attempt=${attempt}/${maxAttempts} | durationMs=${durationMs} | model=${model} | message=${message} | body=${
+            truncate(errorBody, 500)
+          }`,
         );
 
         if (status === 404) {
           const availableModels = await diagnoseGeminiModels();
-          throw new LLMModelNotFoundError("gemini", model, apiVersion, availableModels);
+          throw new LLMModelNotFoundError(
+            "gemini",
+            model,
+            apiVersion,
+            availableModels,
+          );
         }
         if (status === 400) throw new LLMBadRequestError("gemini", message);
-        if (status === 401 || status === 403) throw new LLMAuthError("gemini", message);
+        if (status === 401 || status === 403) {
+          throw new LLMAuthError("gemini", message);
+        }
 
         if (status === 503 || status === 429) {
-          lastError = new LLMError(`Gemini HTTP ${status} (${errorCode}): ${message}`);
+          lastError = new LLMError(
+            `Gemini HTTP ${status} (${errorCode}): ${message}`,
+          );
           const remainingAfter = budget.remaining();
-          const canRetry =
-            attempt < maxAttempts &&
+          const canRetry = attempt < maxAttempts &&
             remainingAfter > retryDelayMs + 500;
           if (canRetry) {
-            console.warn(`[gemini] Transient error ${status}. Retrying in ${retryDelayMs}ms... (${attempt}/${maxAttempts})`);
+            console.warn(
+              `[gemini] Transient error ${status}. Retrying in ${retryDelayMs}ms... (${attempt}/${maxAttempts})`,
+            );
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
             continue;
           }
@@ -510,19 +545,21 @@ async function callGemini(
 
       const validated = validateLLMResponse(parsed, tipoEvento);
       const durationMs = Math.round(performance.now() - attemptStart);
-      console.log(`[gemini] Success | attempt=${attempt}/${maxAttempts} | durationMs=${durationMs} | provider=gemini | result=ok`);
+      console.log(
+        `[gemini] Success | attempt=${attempt}/${maxAttempts} | durationMs=${durationMs} | provider=gemini | result=ok`,
+      );
       return validated;
-
     } catch (error) {
       clearTimeout(timeoutId);
       const durationMs = Math.round(performance.now() - attemptStart);
       if (error instanceof LLMServiceError) throw error;
       if (error instanceof DOMException && error.name === "AbortError") {
         lastError = new LLMTimeoutError("gemini", effectiveTimeout);
-        console.warn(`[gemini] Timeout (${effectiveTimeout}ms) on attempt ${attempt}/${maxAttempts} | durationMs=${durationMs}`);
+        console.warn(
+          `[gemini] Timeout (${effectiveTimeout}ms) on attempt ${attempt}/${maxAttempts} | durationMs=${durationMs}`,
+        );
         const remainingAfter = budget.remaining();
-        const canRetry =
-          attempt < maxAttempts &&
+        const canRetry = attempt < maxAttempts &&
           remainingAfter > retryDelayMs + 500;
         if (canRetry) {
           await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
@@ -531,7 +568,9 @@ async function callGemini(
         throw lastError;
       }
       throw new LLMError(
-        `Gemini request failed: ${error instanceof Error ? error.message : "unknown error"}`
+        `Gemini request failed: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`,
       );
     } finally {
       clearTimeout(timeoutId);
@@ -598,11 +637,14 @@ async function callGroq(
   transcription: string,
   macAddress: string,
   tipoEvento: TipoEvento,
-  budget: LLMBudget
+  budget: LLMBudget,
 ): Promise<GeminiResponse> {
   const apiKey = getGroqApiKey();
   const model = getGroqModel();
-  const configuredTimeoutMs = parseInt(Deno.env.get("GROQ_TIMEOUT_MS") ?? "6000", 10);
+  const configuredTimeoutMs = parseInt(
+    Deno.env.get("GROQ_TIMEOUT_MS") ?? "6000",
+    10,
+  );
 
   const remainingBudget = budget.remaining();
   const effectiveTimeout = Math.min(configuredTimeoutMs, remainingBudget);
@@ -628,7 +670,9 @@ async function callGroq(
   const attemptStart = performance.now();
 
   try {
-    console.log(`[groq] Attempting classification | model=${model} | timeout=${effectiveTimeout}ms | budgetRemaining=${remainingBudget}ms`);
+    console.log(
+      `[groq] Attempting classification | model=${model} | timeout=${effectiveTimeout}ms | budgetRemaining=${remainingBudget}ms`,
+    );
 
     const response = await fetch(GROQ_API_URL, {
       method: "POST",
@@ -643,13 +687,17 @@ async function callGroq(
     if (!response.ok) {
       const errorBody = await response.text();
       const parsed = parseJSONBody(errorBody);
-      const err = parsed.error as { message?: string; type?: string } | undefined;
+      const err = parsed.error as
+        | { message?: string; type?: string }
+        | undefined;
       const status = response.status;
       const message = err?.message ?? "unknown";
       const durationMs = Math.round(performance.now() - attemptStart);
 
       console.error(
-        `[groq] HTTP ${status} | model=${model} | durationMs=${durationMs} | message=${message} | body=${truncate(errorBody, 500)}`
+        `[groq] HTTP ${status} | model=${model} | durationMs=${durationMs} | message=${message} | body=${
+          truncate(errorBody, 500)
+        }`,
       );
 
       if (status === 404) {
@@ -657,11 +705,13 @@ async function callGroq(
           "groq",
           model,
           "n/a",
-          []
+          [],
         );
       }
       if (status === 400) throw new LLMBadRequestError("groq", message);
-      if (status === 401 || status === 403) throw new LLMAuthError("groq", message);
+      if (status === 401 || status === 403) {
+        throw new LLMAuthError("groq", message);
+      }
 
       throw new LLMError(`Groq HTTP ${status}: ${message}`);
     }
@@ -689,11 +739,15 @@ async function callGroq(
     const durationMs = Math.round(performance.now() - attemptStart);
     if (error instanceof LLMServiceError) throw error;
     if (error instanceof DOMException && error.name === "AbortError") {
-      console.warn(`[groq] Timeout (${effectiveTimeout}ms) | durationMs=${durationMs}`);
+      console.warn(
+        `[groq] Timeout (${effectiveTimeout}ms) | durationMs=${durationMs}`,
+      );
       throw new LLMTimeoutError("groq", effectiveTimeout);
     }
     throw new LLMError(
-      `Groq request failed: ${error instanceof Error ? error.message : "unknown error"}`
+      `Groq request failed: ${
+        error instanceof Error ? error.message : "unknown error"
+      }`,
     );
   } finally {
     clearTimeout(timeoutId);
@@ -705,21 +759,27 @@ async function callGroq(
 export async function classifyTranscription(
   transcription: string,
   macAddress: string,
-  tipoEvento: TipoEvento
+  tipoEvento: TipoEvento,
 ): Promise<GeminiResponse> {
   const budget = createBudget();
   const llmStart = performance.now();
 
   try {
-    const result = await callGroq(transcription, macAddress, tipoEvento, budget);
+    const result = await callGroq(
+      transcription,
+      macAddress,
+      tipoEvento,
+      budget,
+    );
     const durationMs = Math.round(performance.now() - llmStart);
-    console.log(`[llm] classifyTranscription completed | provider=groq | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`);
+    console.log(
+      `[llm] classifyTranscription completed | provider=groq | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`,
+    );
     return result;
   } catch (groqError) {
     if (groqError instanceof LLMServiceError) {
       const errorName = groqError.name;
-      const canFallback =
-        groqError instanceof LLMTimeoutError ||
+      const canFallback = groqError instanceof LLMTimeoutError ||
         groqError instanceof LLMInvalidResponseError ||
         (groqError instanceof LLMError &&
           !(groqError instanceof LLMConfigError) &&
@@ -730,17 +790,26 @@ export async function classifyTranscription(
       if (canFallback && budget.canRunGemini()) {
         const groqDurationMs = Math.round(performance.now() - llmStart);
         console.error(
-          `[llm-fallback] Groq failed (${errorName}) after ${groqDurationMs}ms. Attempting Gemini fallback with ${budget.remaining()}ms remaining...`
+          `[llm-fallback] Groq failed (${errorName}) after ${groqDurationMs}ms. Attempting Gemini fallback with ${budget.remaining()}ms remaining...`,
         );
         try {
-          const result = await callGemini(transcription, macAddress, tipoEvento, budget);
+          const result = await callGemini(
+            transcription,
+            macAddress,
+            tipoEvento,
+            budget,
+          );
           const durationMs = Math.round(performance.now() - llmStart);
-          console.log(`[llm] classifyTranscription completed | provider=gemini | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`);
+          console.log(
+            `[llm] classifyTranscription completed | provider=gemini | durationMs=${durationMs} | budgetRemaining=${budget.remaining()}ms`,
+          );
           return result;
         } catch (geminiError) {
           const durationMs = Math.round(performance.now() - llmStart);
           console.error(
-            `[llm-fallback] Gemini also failed after ${durationMs}ms: ${geminiError instanceof Error ? geminiError.message : "unknown"}`
+            `[llm-fallback] Gemini also failed after ${durationMs}ms: ${
+              geminiError instanceof Error ? geminiError.message : "unknown"
+            }`,
           );
           throw geminiError;
         }
@@ -749,7 +818,7 @@ export async function classifyTranscription(
       if (canFallback && !budget.canRunGemini()) {
         const durationMs = Math.round(performance.now() - llmStart);
         console.error(
-          `[llm-fallback] Groq failed (${errorName}) after ${durationMs}ms and budget is exhausted (remaining=${budget.remaining()}ms). Cannot fallback to Gemini.`
+          `[llm-fallback] Groq failed (${errorName}) after ${durationMs}ms and budget is exhausted (remaining=${budget.remaining()}ms). Cannot fallback to Gemini.`,
         );
         throw new LLMTimeoutError("llm-total", budget.remaining());
       }
@@ -793,11 +862,11 @@ export class LLMModelNotFoundError extends LLMServiceError {
     provider: string,
     model: string,
     apiVersion: string,
-    availableModels: string[]
+    availableModels: string[],
   ) {
     super(
       `[${provider}] Model "${model}" not found (API ${apiVersion}). ` +
-        `Available models: [${availableModels.join(", ")}]`
+        `Available models: [${availableModels.join(", ")}]`,
     );
     this.name = "LLMModelNotFoundError";
     this.provider = provider;
