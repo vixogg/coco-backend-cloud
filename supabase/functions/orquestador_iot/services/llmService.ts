@@ -4,6 +4,10 @@ import {
   PrioridadSugerida,
   TipoEvento,
 } from "../types.ts";
+import { truncateTextBySentences } from "./performanceUtils.ts";
+
+const DEFAULT_MAX_OUTPUT_TOKENS = 180;
+const DEFAULT_MAX_TTS_CHARS = 240;
 
 const VALID_INTENCIONES: IntencionDetectada[] = [
   "MENSAJE",
@@ -22,7 +26,7 @@ REGLAS GENERALES
 
 1. Responde EXCLUSIVAMENTE con JSON válido según el esquema de abajo. NUNCA incluyas Markdown, explicaciones, backticks ni texto fuera del JSON.
 2. Tono proactivo, empático y natural para un adulto mayor chileno. Usa "usted" y lenguaje cálido.
-3. Respuestas breves y claras, pensadas para ser sintetizadas por voz. Máximo 2-3 oraciones.
+3. Respuestas breves y claras, pensadas para ser sintetizadas por voz. Máximo 2 oraciones cortas (nunca más de 220 caracteres).
 4. No inventes destinatarios, nombres, fechas, medicamentos ni información que no esté en el mensaje del usuario.
 5. No afirmes que un mensaje fue enviado o que familiares fueron notificados, a menos que el flujo confirme realmente esa acción. Evita prometer acciones que el backend no ejecutó.
 6. Identifica posibles emergencias y responde con intencion_detectada "ALERTA_SOS" si detectas peligro, caída, dolor fuerte o pedido de ayuda urgente.
@@ -237,11 +241,20 @@ export function validateLLMResponse(
     }
   }
 
+  const maxTtsChars = parseInt(
+    Deno.env.get("MAX_TTS_CHARS") ?? String(DEFAULT_MAX_TTS_CHARS),
+    10,
+  );
+  const safeSpokenText = truncateTextBySentences(
+    obj.respuesta_sintetizada as string,
+    maxTtsChars,
+  );
+
   return {
     intencion_detectada: obj.intencion_detectada as IntencionDetectada,
     destinatario_identificado: obj.destinatario_identificado as string | null,
     prioridad_sugerida: obj.prioridad_sugerida as PrioridadSugerida,
-    respuesta_sintetizada: obj.respuesta_sintetizada as string,
+    respuesta_sintetizada: safeSpokenText,
   };
 }
 
@@ -431,10 +444,14 @@ async function callGemini(
   const apiKey = getGeminiApiKey();
   const model = getGeminiModel();
   const apiVersion = getGeminiApiVersion();
-  const timeoutMs = parseInt(Deno.env.get("GEMINI_TIMEOUT_MS") ?? "10000", 10);
-  const maxAttempts = parseInt(Deno.env.get("GEMINI_MAX_RETRIES") ?? "2", 10);
+  const timeoutMs = parseInt(Deno.env.get("GEMINI_TIMEOUT_MS") ?? "4000", 10);
+  const maxAttempts = parseInt(Deno.env.get("GEMINI_MAX_RETRIES") ?? "1", 10);
   const retryDelayMs = parseInt(
     Deno.env.get("GEMINI_RETRY_DELAY_MS") ?? "100",
+    10,
+  );
+  const maxOutputTokens = parseInt(
+    Deno.env.get("LLM_MAX_OUTPUT_TOKENS") ?? String(DEFAULT_MAX_OUTPUT_TOKENS),
     10,
   );
 
@@ -449,6 +466,7 @@ async function callGemini(
       responseMimeType: "application/json",
       responseSchema: RESPONSE_SCHEMA,
       temperature: 0.3,
+      maxOutputTokens,
     },
   };
 
@@ -591,7 +609,7 @@ export interface LLMBudget {
 }
 
 function createBudget(): LLMBudget {
-  const totalMs = parseInt(Deno.env.get("LLM_TOTAL_TIMEOUT_MS") ?? "18000", 10);
+  const totalMs = parseInt(Deno.env.get("LLM_TOTAL_TIMEOUT_MS") ?? "8000", 10);
 
   const start = performance.now();
   const deadline = start + totalMs;
@@ -642,7 +660,11 @@ async function callGroq(
   const apiKey = getGroqApiKey();
   const model = getGroqModel();
   const configuredTimeoutMs = parseInt(
-    Deno.env.get("GROQ_TIMEOUT_MS") ?? "6000",
+    Deno.env.get("GROQ_TIMEOUT_MS") ?? "4000",
+    10,
+  );
+  const maxOutputTokens = parseInt(
+    Deno.env.get("LLM_MAX_OUTPUT_TOKENS") ?? String(DEFAULT_MAX_OUTPUT_TOKENS),
     10,
   );
 
@@ -662,6 +684,7 @@ async function callGroq(
       { role: "user", content: userMessage },
     ],
     temperature: 0.3,
+    max_tokens: maxOutputTokens,
     response_format: { type: "json_object" },
   };
 

@@ -1,41 +1,129 @@
 import { createClient } from "npm:@supabase/supabase-js";
 
-// 1. Importaciones de la IA
+// 1. Importaciones de la IA y utilitarios de alto rendimiento
 import { transcribeAudio } from "./services/sttService.ts";
 import { classifyTranscription } from "./services/llmService.ts";
-import { synthesizeSpeech} from "./services/ttsService.ts";
+import { synthesizeSpeech } from "./services/ttsService.ts";
 import { AwsClient } from "npm:aws4fetch";
-
-// 2. Funciones auxiliares para manejar el audio
-function decodeBase64ToUint8Array(base64: string): Uint8Array {
-  const binaryString = atob(base64);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function uint8ArrayToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
+import {
+  computeWebhookRequestHash,
+  decodeBase64ToUint8ArrayFast,
+  ensureSafeAudioPayloadSize,
+  findBestContactMatch,
+  getCachedDevice,
+  getOrSynthesizeTtsBase64,
+  isDuplicateInMemoryL1,
+  logSafePayload,
+  RedApoyoContact,
+  runInBackground,
+  setCachedDevice,
+  truncateTextBySentences,
+  uint8ArrayToBase64Fast,
+} from "./services/performanceUtils.ts";
 
 /* =========================================================================
-   SECCIÓN 1: CONFIGURACIÓN E INICIALIZACIÓN
+   SECCIÓN 1: CONFIGURACIÓN E INICIALIZACIÓN GLOBAL POR ISOLATE
    ========================================================================= */
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+    detectSessionInUrl: false,
+  },
+});
+
+// Límites deterministas para evitar errores de exceso de bytes en AWS IoT Core (límite duro MQTT: 128 KB)
+// 65,000 bytes crudos en MP3 (32 kbps) ≈ 16.25s de voz ≈ 86.6 KB en Base64 (holgura total bajo 128 KB)
+const MAX_RAW_AUDIO_BYTES = parseInt(Deno.env.get("MAX_RAW_AUDIO_BYTES") ?? "65000", 10);
+const MAX_TTS_CHARS = parseInt(Deno.env.get("MAX_TTS_CHARS") ?? "240", 10);
+
+// Frases estáticas cacheadas en la memoria RAM del isolate tras su primera síntesis (0ms en peticiones siguientes)
+const FRASE_SOS_ESTATICA = "Alerta de emergencia enviada a tu familia. Mantén la calma.";
+const FRASE_CONFIRMACION_AUDIO = "Tu mensaje fue enviado exitosamente.";
+const FRASE_CONTINGENCIA_ERROR =
+  "Disculpe, tuve un inconveniente al procesar su consulta. Por favor intente de nuevo.";
+
+// Singleton perezoso para AwsClient (reutiliza configuración y evita re-instanciar en cada request)
+let cachedAwsClient: AwsClient | null = null;
+let cachedCleanEndpoint = "";
+
+function getAwsIotClient(): { awsClient: AwsClient; cleanEndpoint: string } {
+  const rawEndpoint = Deno.env.get("AWS_IOT_ENDPOINT") || "";
+  const cleanEndpoint = rawEndpoint.replace(/^https?:\/\//, "").replace(/\/$/, "");
+  const iotRegion = Deno.env.get("AWS_IOT_REGION") ?? "us-east-2";
+  const iotAccessKey = Deno.env.get("AWS_IOT_ACCESS_KEY_ID") ?? "";
+  const iotSecretKey = Deno.env.get("AWS_IOT_SECRET_ACCESS_KEY") ?? "";
+
+  if (!cleanEndpoint || !iotAccessKey || !iotSecretKey) {
+    throw new Error("Faltan credenciales de AWS IoT Core en los secrets");
+  }
+
+  if (!cachedAwsClient || cachedCleanEndpoint !== cleanEndpoint) {
+    cachedAwsClient = new AwsClient({
+      accessKeyId: iotAccessKey,
+      secretAccessKey: iotSecretKey,
+      region: iotRegion,
+      service: "iotdata", // CRÍTICO: "iotdata" — no cambiar
+    });
+    cachedCleanEndpoint = cleanEndpoint;
+  }
+
+  return { awsClient: cachedAwsClient, cleanEndpoint: cachedCleanEndpoint };
+}
+
+/**
+ * Publica un payload de audio Base64 hacia el tópico descendente del dispositivo en AWS IoT Core
+ * aplicando firma criptográfica AWS SigV4 con aws4fetch.
+ */
+async function publicarEnAwsIot(
+  macAddress: string,
+  tipoEventoBajada: string,
+  audioB64: string,
+  prioridad: string,
+  etiquetaLog: string,
+): Promise<void> {
+  const { awsClient, cleanEndpoint } = getAwsIotClient();
+
+  // NUNCA usar encodeURIComponent en el tópico — rompería el hash del canonical URI en SigV4
+  const topicRx = `coco/dispositivos/${macAddress}/rx`;
+  const publishUrl = `https://${cleanEndpoint}/topics/${topicRx}?qos=1`;
+
+  const payloadDescendente = {
+    mac_address: macAddress,
+    tipo_evento: tipoEventoBajada,
+    formato_payload: "AUDIO_B64",
+    data: audioB64,
+    prioridad,
+  };
+
+  const bodyStr = JSON.stringify(payloadDescendente);
+  console.log(
+    `[IoT TX] (${etiquetaLog}) Tópico: ${topicRx} | Payload total: ${bodyStr.length} bytes (Límite AWS: 131072 bytes)`,
+  );
+
+  const iotResponse = await awsClient.fetch(publishUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: bodyStr,
+  });
+
+  if (!iotResponse.ok) {
+    const errTexto = await iotResponse.text();
+    console.error(`[IoT TX ERROR] (${etiquetaLog}) Status: ${iotResponse.status} | Body: ${errTexto}`);
+    throw new Error(`No se pudo entregar el mensaje al dispositivo (${iotResponse.status})`);
+  }
+
+  console.log(`[IoT TX OK] (${etiquetaLog}) Audio entregado exitosamente al dispositivo ${macAddress}.`);
+}
 
 Deno.serve(async (req) => {
   /* =========================================================================
-     SECCIÓN 2: VALIDACIÓN DEL WEBHOOK Y CONTRATO DE ENTRADA (Tx)
+     SECCIÓN 2: VALIDACIÓN DEL WEBHOOK, LOG SEGURO E IDEMPOTENCIA L1
      ========================================================================= */
-  console.log(`\n=== NUEVA PETICIÓN ENTRANTE ===`);
+  const requestStartMs = performance.now();
+  console.log(`\n=== NUEVA PETICIÓN ENTRANTE (orquestador_iot) ===`);
   console.log(`[HTTP] Método: ${req.method} | URL: ${req.url}`);
 
   if (req.method !== "POST") {
@@ -43,324 +131,420 @@ Deno.serve(async (req) => {
     return new Response(JSON.stringify({ error: "Método no permitido" }), { status: 405 });
   }
 
-  try {
-    // Leemos el payload como texto crudo para auditarlo antes de que falle
-    const bodyText = await req.text();
-    console.log(`[PAYLOAD CRUDO RECIBIDO]:\n`, bodyText);
+  let macAddressValidada: string | null = null;
 
-    const payload = JSON.parse(bodyText); 
-    const { mac_address, tipo_evento, formato_payload, data } = payload;
+  try {
+    const bodyText = await req.text();
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      console.warn(`[BLOQUEO] El cuerpo recibido no es un JSON válido.`);
+      return new Response(JSON.stringify({ error: "Contrato JSON inválido" }), { status: 400 });
+    }
+
+    // Log estructurado sin volcar cientos de KB de Base64 en stdout
+    logSafePayload("orquestador_iot", "Payload recibido", payload);
+
+    const { mac_address, tipo_evento, formato_payload, data } = payload as {
+      mac_address?: string;
+      tipo_evento?: string;
+      formato_payload?: string;
+      data?: string;
+    };
 
     if (!mac_address || !tipo_evento || !data || !formato_payload) {
       console.warn(`[BLOQUEO] Contrato JSON inválido o incompleto. Faltan campos.`);
-      return new Response(JSON.stringify({ error: "Contrato JSON inválido o incompleto" }), { status: 400 });
+      return new Response(JSON.stringify({ error: "Contrato JSON inválido o incompleto" }), {
+        status: 400,
+      });
     }
 
     if (formato_payload !== "AUDIO_B64" && formato_payload !== "TEXTO") {
       console.warn(`[BLOQUEO] Formato de payload no soportado: ${formato_payload}`);
-      return new Response(JSON.stringify({ error: "Formato de payload no soportado" }), { status: 400 });
+      return new Response(JSON.stringify({ error: "Formato de payload no soportado" }), {
+        status: 400,
+      });
+    }
+
+    // --- Compuerta de Idempotencia L1 en Memoria (Frena reintentos de AWS IoT Core) ---
+    const requestHash = await computeWebhookRequestHash(
+      mac_address,
+      tipo_evento,
+      formato_payload,
+      data,
+    );
+
+    if (isDuplicateInMemoryL1(requestHash, 60_000)) {
+      console.warn(
+        `[IDEMPOTENCIA L1] Reintento duplicado de AWS IoT Core detectado para MAC ${mac_address} (hash=${requestHash}). Retornando 200 OK para detener tormenta de reintentos.`,
+      );
+      return new Response(
+        JSON.stringify({
+          success: true,
+          deduplicated: true,
+          message: "Petición duplicada ignorada de forma segura.",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
     }
 
     /* =========================================================================
-       SECCIÓN 3: SEGURIDAD Y VERIFICACIÓN DEL GEMELO DIGITAL
+       SECCIÓN 3: SEGURIDAD Y VERIFICACIÓN DEL GEMELO DIGITAL (CON CACHÉ RAM)
        ========================================================================= */
-    const { data: dispositivo, error: errorDispositivo } = await supabase
-      .from("dispositivos_coco")
-      .select("id, adulto_mayor_id")
-      .eq("mac_address", mac_address)
-      .single();
+    let dispositivo = getCachedDevice(mac_address);
 
-    if (errorDispositivo || !dispositivo) {
-      console.warn(`[BLOQUEO] Dispositivo no registrado en BD: ${mac_address}`);
-      return new Response(JSON.stringify({ error: "Dispositivo no autorizado" }), { status: 403 });
+    if (!dispositivo) {
+      const { data: dispDb, error: errorDispositivo } = await supabase
+        .from("dispositivos_coco")
+        .select("id, adulto_mayor_id")
+        .eq("mac_address", mac_address)
+        .single();
+
+      if (errorDispositivo || !dispDb) {
+        console.warn(`[BLOQUEO] Dispositivo no registrado en BD: ${mac_address}`);
+        return new Response(JSON.stringify({ error: "Dispositivo no autorizado" }), {
+          status: 403,
+        });
+      }
+
+      setCachedDevice(mac_address, {
+        id: dispDb.id,
+        adulto_mayor_id: dispDb.adulto_mayor_id,
+      });
+      dispositivo = getCachedDevice(mac_address)!;
+    } else {
+      console.log(`[DEVICE CACHE HIT] Dispositivo ${mac_address} validado en memoria (0ms).`);
     }
+
+    macAddressValidada = mac_address;
 
     /* =========================================================================
        SECCIÓN 4: ORQUESTACIÓN IA Y BYPASS DE HARDWARE
        ========================================================================= */
-    // TypeScript requiere que el objeto sea 'const' si no lo reasignamos por completo.
-    const resultadoIA = {
-      intencion_detectada: "",
-      texto_procesado: null as string | null,
-      destinatario_identificado: null as string | null,
-      prioridad_sugerida: "NORMAL",
-      audio_respuesta_b64: "",
-      url_storage: null as string | null,
-      tipo_evento_bajada: "RESPUESTA_IA" 
-    };
 
-    if (tipo_evento === "ALERTA_SOS" && formato_payload === "TEXTO" && data === "EMERGENCIA_BOTON_PANICO") {
-      // CASO 1: BYPASS Botón físico (Saltamos Deepgram y Gemini)
+    // -------------------------------------------------------------------------
+    // CASO 1: BYPASS Botón físico SOS (Saltamos Deepgram y LLM + TTS en Caché RAM)
+    // -------------------------------------------------------------------------
+    if (
+      tipo_evento === "ALERTA_SOS" &&
+      formato_payload === "TEXTO" &&
+      data === "EMERGENCIA_BOTON_PANICO"
+    ) {
       console.log(`[BYPASS IA] Botón de pánico físico presionado para MAC: ${mac_address}`);
-      resultadoIA.intencion_detectada = "ALERTA_SOS";
-      resultadoIA.prioridad_sugerida = "URGENTE";
-      resultadoIA.texto_procesado = "Emergencia activada mecánicamente mediante botón de pánico.";
-      
-      const synthesizedAudio = await synthesizeSpeech("Alerta de emergencia enviada a tu familia. Mantén la calma.");
-      resultadoIA.audio_respuesta_b64 = uint8ArrayToBase64(synthesizedAudio);
 
-    } else if (tipo_evento === "AUDIO_DIRECTO" && formato_payload === "AUDIO_B64") {
-      // CASO 2: BYPASS — Nota de Voz del hardware hacia la App.
-      // El abuelo ya grabó el audio. Subimos al bucket y notificamos sin pasar por IA.
-      console.log(`[BYPASS AUDIO_DIRECTO] Recibiendo nota de voz para MAC: ${mac_address}`);
-
-      // --- Subida al bucket 'audios_directos_coco' ---
-      const audioBytes = decodeBase64ToUint8Array(data);
-      // Path con subcarpeta 'mensajes/' para separar notas de voz de otros assets.
-      // El path interno (no URL pública) es el que se guarda en historial para auditoría.
-      const rutaStorage = `mensajes/coco_audio_rx_${Date.now()}.wav`;
-
-      let uploadOk = false;
-      try {
-        const { error: uploadError } = await supabase
-          .storage
-          .from("audios_directos_coco")
-          .upload(rutaStorage, audioBytes, { contentType: "audio/wav" });
-
-        if (uploadError) {
-          // Log descriptivo pero no bloqueante: el hardware igual recibe confirmación
-          console.error(`[STORAGE ERROR] Fallo al subir '${rutaStorage}': ${uploadError.message}`);
-        } else {
-          uploadOk = true;
-          console.log(`[STORAGE OK] Nota de voz guardada en: ${rutaStorage}`);
-        }
-      } catch (storageEx) {
-        const msg = storageEx instanceof Error ? storageEx.message : String(storageEx);
-        console.error(`[STORAGE EXCEPTION] ${msg}`);
-      }
-
-      // --- Insertar en historial_interacciones (bypass propio, no cae a SECCIÓN 5) ---
-      const { error: errorInsertAudio } = await supabase
-        .from("historial_interacciones")
-        .insert({
-          dispositivo_id: dispositivo.id,
-          emisor: "COCO",
-          destinatario_id: null,
-          tipo_evento: "AUDIO_DIRECTO",
-          metadata_payload: {
-            url_audio_referencia: uploadOk ? rutaStorage : null,
-            texto_procesado: "🎤 Nota de voz entrante",
-            procesado_por_ia: false,
-          },
-          estado_reproduccion: "PENDIENTE",
-          prioridad: "NORMAL",
-        });
-
-      if (errorInsertAudio) {
-        // No lanzamos throw: el hardware debe recibir su confirmación de todas formas
-        console.error(`[BD ERROR] No se pudo insertar en historial: ${errorInsertAudio.message}`);
-      } else {
-        console.log(`[BD OK] AUDIO_DIRECTO registrado en historial_interacciones`);
-      }
-
-      // --- TTS de confirmación para el hardware ---
-      const synthesizedConfirmacion = await synthesizeSpeech("Tu mensaje fue enviado exitosamente.");
-      const audioConfirmacionB64 = uint8ArrayToBase64(synthesizedConfirmacion);
-
-      // --- Dispatch MQTT propio con SigV4 (early return) ---
-      // tipo_evento: "RESPUESTA_IA" para que el hardware vuelva a su estado normal de escucha
-      const rawEndpointBypass = Deno.env.get("AWS_IOT_ENDPOINT") || "";
-      const cleanEndpointBypass = rawEndpointBypass.replace(/^https?:\/\//, "");
-      const iotRegionBypass = Deno.env.get("AWS_IOT_REGION") ?? "us-east-2";
-      const iotAccessKeyBypass = Deno.env.get("AWS_IOT_ACCESS_KEY_ID") ?? "";
-      const iotSecretKeyBypass = Deno.env.get("AWS_IOT_SECRET_ACCESS_KEY") ?? "";
-
-      if (!cleanEndpointBypass || !iotAccessKeyBypass || !iotSecretKeyBypass) {
-        throw new Error("Faltan credenciales de AWS IoT Core en los secrets");
-      }
-
-      const awsClientBypass = new AwsClient({
-        accessKeyId: iotAccessKeyBypass,
-        secretAccessKey: iotSecretKeyBypass,
-        region: iotRegionBypass,
-        service: "iotdata", // CRÍTICO: "iotdata" — no cambiar
-      });
-
-      // NUNCA usar encodeURIComponent en el tópico — rompería el hash del canonical URI
-      const topicRxBypass = `coco/dispositivos/${mac_address}/rx`;
-      const publishUrlBypass = `https://${cleanEndpointBypass}/topics/${topicRxBypass}?qos=1`;
-      const payloadBypass = {
-        mac_address: mac_address,
-        tipo_evento: "RESPUESTA_IA",
-        formato_payload: "AUDIO_B64",
-        data: audioConfirmacionB64,
-        prioridad: "NORMAL",
-      };
-
-      const bodyStrBypass = JSON.stringify(payloadBypass);
-      console.log(`[IoT TX BYPASS] Enviando confirmación en tópico: ${topicRxBypass}`);
-
-      const iotResponseBypass = await awsClientBypass.fetch(publishUrlBypass, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: bodyStrBypass,
-      });
-
-      if (!iotResponseBypass.ok) {
-        const errTexto = await iotResponseBypass.text();
-        console.error(`[IoT TX ERROR BYPASS] Status: ${iotResponseBypass.status} | Body: ${errTexto}`);
-        throw new Error("No se pudo entregar la confirmación al dispositivo");
-      }
-
-      console.log(`[IoT TX OK BYPASS] Confirmación entregada. Bypass AUDIO_DIRECTO completo.`);
-      // EARLY RETURN: este caso no continúa a SECCIÓN 5-6
-      return new Response(
-        JSON.stringify({ success: true, message: "Nota de voz procesada y confirmación enviada al hardware." }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
+      const audioSosB64 = await getOrSynthesizeTtsBase64(
+        FRASE_SOS_ESTATICA,
+        synthesizeSpeech,
+        MAX_RAW_AUDIO_BYTES,
       );
 
+      // Camino Crítico: Publicamos de inmediato en AWS IoT Core hacia el parlante
+      await publicarEnAwsIot(
+        mac_address,
+        "RESPUESTA_IA",
+        audioSosB64,
+        "URGENTE",
+        "BYPASS_SOS",
+      );
 
-    } else if (formato_payload === "AUDIO_B64") {
-      // CASO 3: FLUJO NORMAL Procesamiento de Voz con IA
+      // Camino Background (waitUntil): Guardamos la alerta SOS en historial_interacciones
+      runInBackground(
+        (async () => {
+          const { error: errorInsertSos } = await supabase
+            .from("historial_interacciones")
+            .insert({
+              dispositivo_id: dispositivo.id,
+              emisor: "COCO",
+              destinatario_id: null,
+              tipo_evento: "ALERTA_SOS",
+              metadata_payload: {
+                texto_procesado: "Emergencia activada mecánicamente mediante botón de pánico.",
+                url_audio_referencia: null,
+                procesado_por_ia: false,
+              },
+              estado_reproduccion: "PENDIENTE",
+              prioridad: "URGENTE",
+            });
+
+          if (errorInsertSos) {
+            console.error(`[BD ERROR SOS] Fallo al guardar en historial: ${errorInsertSos.message}`);
+          } else {
+            console.log(`[EMERGENCIA] Alerta SOS registrada para el dispositivo ${dispositivo.id}.`);
+          }
+        })(),
+        "persistencia_sos",
+      );
+
+      const elapsedMs = Math.round(performance.now() - requestStartMs);
+      console.log(`[FIN BYPASS SOS] Completado en ${elapsedMs}ms.`);
+      return new Response(
+        JSON.stringify({ success: true, message: "Alerta SOS procesada exitosamente" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // CASO 2: BYPASS AUDIO_DIRECTO — Nota de Voz del hardware hacia la App
+    // -------------------------------------------------------------------------
+    if (tipo_evento === "AUDIO_DIRECTO" && formato_payload === "AUDIO_B64") {
+      console.log(`[BYPASS AUDIO_DIRECTO] Recibiendo nota de voz para MAC: ${mac_address}`);
+      const rutaStorage = `mensajes/coco_audio_rx_${Date.now()}.wav`;
+
+      // 1. Obtenemos el audio de confirmación desde caché en RAM (0ms si ya fue sintetizado)
+      const audioConfirmacionB64 = await getOrSynthesizeTtsBase64(
+        FRASE_CONFIRMACION_AUDIO,
+        synthesizeSpeech,
+        MAX_RAW_AUDIO_BYTES,
+      );
+
+      // 2. Despachamos de inmediato la confirmación al hardware para no hacer esperar al abuelo
+      await publicarEnAwsIot(
+        mac_address,
+        "RESPUESTA_IA",
+        audioConfirmacionB64,
+        "NORMAL",
+        "BYPASS_AUDIO_DIRECTO",
+      );
+
+      // 3. Subida al bucket 'audios_directos_coco' + INSERT en historial_interacciones en segundo plano
+      runInBackground(
+        (async () => {
+          const audioBytes = decodeBase64ToUint8ArrayFast(data);
+          let uploadOk = false;
+
+          try {
+            const { error: uploadError } = await supabase
+              .storage
+              .from("audios_directos_coco")
+              .upload(rutaStorage, audioBytes, { contentType: "audio/wav" });
+
+            if (uploadError) {
+              console.error(`[STORAGE ERROR] Fallo al subir '${rutaStorage}': ${uploadError.message}`);
+            } else {
+              uploadOk = true;
+              console.log(`[STORAGE OK] Nota de voz guardada en: ${rutaStorage}`);
+            }
+          } catch (storageEx) {
+            const msg = storageEx instanceof Error ? storageEx.message : String(storageEx);
+            console.error(`[STORAGE EXCEPTION] ${msg}`);
+          }
+
+          const { error: errorInsertAudio } = await supabase
+            .from("historial_interacciones")
+            .insert({
+              dispositivo_id: dispositivo.id,
+              emisor: "COCO",
+              destinatario_id: null,
+              tipo_evento: "AUDIO_DIRECTO",
+              metadata_payload: {
+                url_audio_referencia: uploadOk ? rutaStorage : null,
+                texto_procesado: "🎤 Nota de voz entrante",
+                procesado_por_ia: false,
+              },
+              estado_reproduccion: "PENDIENTE",
+              prioridad: "NORMAL",
+            });
+
+          if (errorInsertAudio) {
+            console.error(`[BD ERROR] No se pudo insertar en historial: ${errorInsertAudio.message}`);
+          } else {
+            console.log(`[BD OK] AUDIO_DIRECTO registrado en historial_interacciones`);
+          }
+        })(),
+        "storage_e_historial_audio_directo",
+      );
+
+      const elapsedMs = Math.round(performance.now() - requestStartMs);
+      console.log(`[FIN BYPASS AUDIO_DIRECTO] Confirmación entregada en ${elapsedMs}ms.`);
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "Nota de voz procesada y confirmación enviada al hardware.",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // CASO 3: FLUJO NORMAL — Procesamiento de Voz con IA (STT -> LLM -> TTS + BD Paralela)
+    // -------------------------------------------------------------------------
+    if (formato_payload === "AUDIO_B64") {
       console.log(`[PROCESAMIENTO IA] Audio recibido para MAC: ${mac_address}`);
-      const decodedAudio = decodeBase64ToUint8Array(data);
+      const decodedAudio = decodeBase64ToUint8ArrayFast(data);
       const transcription = await transcribeAudio(decodedAudio);
-      
-      const classification = await classifyTranscription(transcription, mac_address, tipo_evento);
-      const synthesizedAudio = await synthesizeSpeech(classification.respuesta_sintetizada);
-      
-      resultadoIA.intencion_detectada = classification.intencion_detectada;
-      resultadoIA.texto_procesado = transcription;
-      resultadoIA.destinatario_identificado = classification.destinatario_identificado;
-      resultadoIA.prioridad_sugerida = classification.prioridad_sugerida;
-      resultadoIA.audio_respuesta_b64 = uint8ArrayToBase64(synthesizedAudio);
 
-      // CONFIRMACION_ESCUCHA — Gatillo para que Andrés abra el micrófono.
-      // Se activa cuando Gemini detecta que el abuelo quiere enviar una nota de voz.
-      // No se requiere destinatario_identificado: la intención sola es suficiente.
-      if (classification.intencion_detectada === "AUDIO_DIRECTO") {
-        resultadoIA.tipo_evento_bajada = "CONFIRMACION_ESCUCHA";
-        console.log(`[TRIGGER HARDWARE] Intención AUDIO_DIRECTO detectada → forzando tipo_evento_bajada: CONFIRMACION_ESCUCHA`);
+      const classification = await classifyTranscription(
+        transcription,
+        mac_address,
+        tipo_evento as "MENSAJE" | "ALERTA_SOS",
+      );
+
+      // Segunda barrera determinista de longitud de texto antes de ElevenLabs
+      const textoSeguroTts = truncateTextBySentences(
+        classification.respuesta_sintetizada,
+        MAX_TTS_CHARS,
+      );
+
+      // CONFIRMACION_ESCUCHA — Gatillo para que Andrés abra el micrófono
+      const tipoEventoBajada =
+        classification.intencion_detectada === "AUDIO_DIRECTO"
+          ? "CONFIRMACION_ESCUCHA"
+          : "RESPUESTA_IA";
+
+      if (tipoEventoBajada === "CONFIRMACION_ESCUCHA") {
+        console.log(
+          `[TRIGGER HARDWARE] Intención AUDIO_DIRECTO detectada → forzando tipo_evento_bajada: CONFIRMACION_ESCUCHA`,
+        );
       }
-    } else {
-      return new Response(JSON.stringify({ error: "Combinación de payload no válida" }), { status: 400 });
+
+      /* =======================================================================
+         SECCIÓN 5 (PARALELA / BACKGROUND): ENRUTAMIENTO Y PERSISTENCIA EN BD
+         Se lanza en segundo plano mediante EdgeRuntime.waitUntil para no sumar
+         los ~300-450ms de PostgreSQL al tiempo de respuesta del parlante.
+         ======================================================================= */
+      const tipo_evento_db: string = classification.intencion_detectada;
+      const destinatarioIdentificado = classification.destinatario_identificado;
+      const prioridadSugerida = classification.prioridad_sugerida;
+
+      runInBackground(
+        (async () => {
+          let destinatario_uuid: string | null = null;
+
+          if (tipo_evento_db === "MENSAJE" && destinatarioIdentificado) {
+            console.log(
+              `[RUTEO] Buscando UUID en red_apoyo para el apodo/rol: "${destinatarioIdentificado}"`,
+            );
+            const { data: contactosActivos, error: errContactos } = await supabase
+              .from("red_apoyo")
+              .select("usuario_app_id, rol, apodos_reconocimiento")
+              .eq("dispositivo_id", dispositivo.id)
+              .eq("activo", true);
+
+            if (errContactos) {
+              console.warn(`[RUTEO WARN] Error consultando red_apoyo: ${errContactos.message}`);
+            } else if (contactosActivos && contactosActivos.length > 0) {
+              destinatario_uuid = findBestContactMatch(
+                contactosActivos as RedApoyoContact[],
+                destinatarioIdentificado,
+              );
+            }
+          }
+
+          const metadata_payload = {
+            texto_procesado: transcription,
+            url_audio_referencia: null,
+            procesado_por_ia: true,
+          };
+
+          const { error: errorInsert } = await supabase
+            .from("historial_interacciones")
+            .insert({
+              dispositivo_id: dispositivo.id,
+              emisor: "COCO",
+              destinatario_id: destinatario_uuid,
+              tipo_evento: tipo_evento_db,
+              metadata_payload: metadata_payload,
+              estado_reproduccion: "PENDIENTE",
+              prioridad: prioridadSugerida,
+            });
+
+          if (errorInsert) {
+            console.error(`[BD ERROR] Fallo al guardar en historial: ${errorInsert.message}`);
+          } else {
+            switch (tipo_evento_db) {
+              case "ALERTA_SOS":
+                console.log(`[EMERGENCIA] Alerta SOS registrada para el dispositivo ${dispositivo.id}.`);
+                break;
+              case "MENSAJE":
+                console.log(
+                  `[MENSAJE] Entregado al buzón asíncrono del UUID: ${destinatario_uuid || "Desconocido"}.`,
+                );
+                break;
+              case "AUDIO_DIRECTO":
+                console.log(`[AUDIO DIRECTO] Solicitud de apertura de micrófono registrada.`);
+                break;
+              case "RECORDATORIO":
+                console.log(`[RECORDATORIO] Lógica de agendamiento pospuesta para Fase 2.`);
+                break;
+            }
+          }
+        })(),
+        "ruteo_e_historial_ia",
+      );
+
+      /* =======================================================================
+         SECCIÓN 6 (CAMINO CRÍTICO): TTS ELEVENLABS + SALVAGUARDA MP3 + AWS IOT
+         ======================================================================= */
+      const rawSynthesizedAudio = await synthesizeSpeech(textoSeguroTts);
+
+      // Tercera barrera determinista: corte exacto en límite de frame MP3 si supera MAX_RAW_AUDIO_BYTES
+      const safeSynthesizedAudio = ensureSafeAudioPayloadSize(
+        rawSynthesizedAudio,
+        MAX_RAW_AUDIO_BYTES,
+      );
+      const audioRespuestaB64 = uint8ArrayToBase64Fast(safeSynthesizedAudio);
+
+      await publicarEnAwsIot(
+        mac_address,
+        tipoEventoBajada,
+        audioRespuestaB64,
+        prioridadSugerida,
+        `FLUJO_IA_${tipoEventoBajada}`,
+      );
+
+      const elapsedMs = Math.round(performance.now() - requestStartMs);
+      console.log(`[FIN ORQUESTACIÓN IA] Completada exitosamente en ${elapsedMs}ms.`);
+
+      return new Response(
+        JSON.stringify({ success: true, message: "Orquestación exitosa" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
     }
 
-    /* =========================================================================
-       SECCIÓN 5: LÓGICA DE ENRUTAMIENTO Y PERSISTENCIA (El Cerebro)
-       ========================================================================= */
-       
-    const tipo_evento_db: string = resultadoIA.intencion_detectada;
-
-    let destinatario_uuid = null;
-    
-    if (tipo_evento_db === "MENSAJE" && resultadoIA.destinatario_identificado) {
-      console.log(`[RUTEO] Buscando UUID para el apodo/rol: ${resultadoIA.destinatario_identificado}`);
-      const { data: contacto } = await supabase
-        .from("red_apoyo")
-        .select("usuario_app_id")
-        .eq("dispositivo_id", dispositivo.id)
-        .eq("activo", true)
-        .or(`rol.ilike.%${resultadoIA.destinatario_identificado}%,apodos_reconocimiento.cs.{${resultadoIA.destinatario_identificado}}`)
-        .limit(1)
-        .single();
-        
-      if (contacto) destinatario_uuid = contacto.usuario_app_id;
-    }
-
-    const metadata_payload = {
-      texto_procesado: resultadoIA.texto_procesado,
-      url_audio_referencia: resultadoIA.url_storage, // Mapea la URL del bucket si existe
-      procesado_por_ia: formato_payload === "AUDIO_B64" && !resultadoIA.url_storage
-    };
-
-    const { error: errorInsert } = await supabase
-      .from("historial_interacciones")
-      .insert({
-        dispositivo_id: dispositivo.id,
-        emisor: 'COCO',
-        destinatario_id: destinatario_uuid,
-        tipo_evento: tipo_evento_db,
-        metadata_payload: metadata_payload,
-        estado_reproduccion: 'PENDIENTE',
-        prioridad: resultadoIA.prioridad_sugerida
-      });
-
-    if (errorInsert) throw new Error(`Fallo al guardar en historial: ${errorInsert.message}`);
-
-    switch (tipo_evento_db) {
-      case "ALERTA_SOS":
-        console.log(`[EMERGENCIA] Alerta SOS registrada para el dispositivo ${dispositivo.id}.`);
-        break;
-      case "MENSAJE":
-        console.log(`[MENSAJE] Entregado al buzón asíncrono del UUID: ${destinatario_uuid || 'Desconocido'}.`);
-        break;
-      case "AUDIO_DIRECTO":
-        console.log(`[AUDIO DIRECTO] Rutina ejecutada (Charla o Nota de Voz).`);
-        break;
-      case "RECORDATORIO":
-        console.log(`[RECORDATORIO] Lógica de agendamiento pospuesta para Fase 2.`);
-        break;
-    }
-
-/* =========================================================================
-       SECCIÓN 6: ENRUTAMIENTO Y CANAL DE BAJADA (Rx) HACIA AWS IOT CORE
-       =====================================================================
-       FIX: Se reemplazó la función signRequest manual por aws4fetch.
-       La firma SigV4 manual calculaba mal el canonical URI (slashes del
-       tópico MQTT), el query string (?qos=1) y/o el hash del body,
-       causando un 403 Signature Mismatch permanente.
-       aws4fetch delega todo el proceso de firma a SubtleCrypto nativo.
-       ========================================================================= */
-    const payloadDescendente = {
-      mac_address: mac_address,
-      tipo_evento: resultadoIA.tipo_evento_bajada, 
-      formato_payload: "AUDIO_B64",
-      data: resultadoIA.audio_respuesta_b64,
-      prioridad: resultadoIA.prioridad_sugerida
-    };
-    // Leer credenciales de AWS IoT Core desde los secrets de Supabase
-    const rawEndpoint = Deno.env.get("AWS_IOT_ENDPOINT") || "";
-    const cleanEndpoint = rawEndpoint.replace(/^https?:\/\//, '');
-    const iotRegion = Deno.env.get("AWS_IOT_REGION") ?? "us-east-2";
-    const iotAccessKey = Deno.env.get("AWS_IOT_ACCESS_KEY_ID") ?? "";
-    const iotSecretKey = Deno.env.get("AWS_IOT_SECRET_ACCESS_KEY") ?? "";
-    if (!cleanEndpoint || !iotAccessKey || !iotSecretKey) {
-      throw new Error("Faltan credenciales de AWS IoT Core en los secrets");
-    }
-    // Instanciar el cliente aws4fetch con servicio 'iotdata' explícito
-    // aws4fetch usa SubtleCrypto (Web API nativa de Deno) para la firma SigV4
-    const awsClient = new AwsClient({
-      accessKeyId: iotAccessKey,
-      secretAccessKey: iotSecretKey,
-      region: iotRegion,
-      service: "iotdata",
+    return new Response(JSON.stringify({ error: "Combinación de payload no válida" }), {
+      status: 400,
     });
-    // Construir la URL de publicación
-    // aws4fetch maneja la canonicalización de los slashes '/' en el tópico
-    // MQTT internamente de forma segura — NO usar encodeURIComponent aquí
-    const topicRx = `coco/dispositivos/${mac_address}/rx`;
-    const publishUrl = `https://${cleanEndpoint}/topics/${topicRx}?qos=1`;
-    const bodyStr = JSON.stringify(payloadDescendente);
-    console.log(`[IoT TX] Enviando audio de vuelta en tópico: ${topicRx}`);
-    console.log(`[IoT TX] URL: ${publishUrl}`);
-    console.log(`[IoT TX] Payload size: ${bodyStr.length} bytes`);
-    // aws4fetch.fetch() firma automáticamente:
-    // - Canonical URI (con slashes intactos)
-    // - Canonical Query String (qos=1)
-    // - Hash SHA-256 del body
-    // - Headers requeridos (Host, X-Amz-Date, Authorization)
-    const iotResponse = await awsClient.fetch(publishUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: bodyStr,
-    });
-    if (!iotResponse.ok) {
-      const errTexto = await iotResponse.text();
-      console.error(`[IoT TX ERROR] Status: ${iotResponse.status}`);
-      console.error(`[IoT TX ERROR] Body: ${errTexto}`);
-      console.error(`[IoT TX ERROR] Headers:`, Object.fromEntries(iotResponse.headers.entries()));
-      throw new Error("No se pudo entregar el mensaje al dispositivo físico");
-    }
-    console.log(`[IoT TX OK] Mensaje entregado exitosamente al dispositivo.`);
-    return new Response(JSON.stringify({ success: true, message: "Orquestación exitosa" }), { 
-      status: 200, 
-      headers: { "Content-Type": "application/json" } 
-    });
-
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.error("Error crítico en orquestador_iot:", errorMessage);
-    return new Response(JSON.stringify({ error: "Fallo interno en el orquestador" }), { status: 500 });
+
+    // SALVAGUARDA ANTI-REINTENTOS Y ANTI-SILENCIO:
+    // Si la petición provino de un dispositivo válido pero falló un servicio aguas abajo,
+    // enviamos un audio corto de contingencia y respondemos HTTP 200 OK para que el Rules Engine
+    // de AWS IoT Core NO reintente el Webhook 2 veces más.
+    if (macAddressValidada) {
+      const macDestino = macAddressValidada;
+      runInBackground(
+        (async () => {
+          const audioContingenciaB64 = await getOrSynthesizeTtsBase64(
+            FRASE_CONTINGENCIA_ERROR,
+            synthesizeSpeech,
+            MAX_RAW_AUDIO_BYTES,
+          );
+          await publicarEnAwsIot(
+            macDestino,
+            "RESPUESTA_IA",
+            audioContingenciaB64,
+            "NORMAL",
+            "CONTINGENCIA_ERROR",
+          );
+        })(),
+        "contingencia_error_audio",
+      );
+
+      return new Response(
+        JSON.stringify({
+          success: false,
+          handled_error: true,
+          error: "Fallo controlado en el orquestador (contingencia activada)",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    return new Response(JSON.stringify({ error: "Fallo interno en el orquestador" }), {
+      status: 500,
+    });
   }
 });
