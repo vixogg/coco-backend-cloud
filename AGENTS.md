@@ -115,6 +115,9 @@ respuesta_sintetizada: string; }
   familiares, codificación Base64 nativa V8 (`toBase64`/`fromBase64`),
   pre-descarga paralela (`Promise.all`) de notas de voz desde Supabase Storage
   durante el Despacho 1 e inserción concurrente en `historial_interacciones`.
+  **Iteración 12 (v13):** la frase introductoria usa parentesco
+  (`apodos_reconocimiento`) + nombre real (`usuarios_app.nombre`); `red_apoyo.rol`
+  ya no se pronuncia.
 - **[PENDIENTE] `app_gestion`:** Endpoints para que Martín administre la red de
   apoyo.
 - **[DESPLEGADO] Asistente conversacional (Iteración 10):**
@@ -941,3 +944,68 @@ Desplegado como `orquestador_iot` **v58**.
 
 **Pendiente:** verificar en producción, con Tavily, las preguntas de dato
 concreto (logs `[TOOL ENCICLOPEDIA]`); revisión del prompt por Diego.
+
+---
+
+### Iteración 12 — Frase introductoria natural en app_mensajeria (2026-11-13)
+
+**Objetivo:** que el abuelo deje de escuchar "Hola Don Carlos, tu ADMINISTRADOR
+sobrino te envió un audio." y escuche "Hola Don Carlos, tu sobrino Jose te envió
+un audio.".
+
+**Diagnóstico (BD vía MCP + logs de v12):**
+
+- `red_apoyo.rol` es un permiso (`ADMINISTRADOR|CONTACTO`), pero se pronunciaba
+  como parentesco. En `historial_interacciones` (87 filas APP) quedaron frases
+  como "tu ADMINISTRADOR sobrino", "tu CONTACTO hijo", "tu ADMINISTRADOR martin"
+  y, cuando `apodos_reconocimiento` estaba vacío, **"tu ADMINISTRADOR
+  ADMINISTRADOR"** (10 veces).
+- El nombre real del familiar (`usuarios_app.nombre`) nunca se consultaba.
+- Datos reales: `red_apoyo` tiene 5 filas (Martin `["martin"]`, jose
+  `["sobrino"]`, "Martín (Cuidador Prueba)" `["hijo"]`, Ana `["Hermana"]`,
+  Vicente `["Nieto","Vicente","Vicho","Familia"]`).
+
+**Archivos tocados:**
+
+- `app_mensajeria/services/introService.ts` — **Nuevo.** Función pura
+  `construirFraseIntroductoria({ nombreAbuelo, emisorEnRed, nombreFamiliar,
+  apodos, tipoContenido })`:
+  - Parentesco: el primer apodo que, normalizado (sin tildes ni mayúsculas, sin
+    "mi/mis/el/la"), esté en un diccionario cerrado (hijo/a, nieto/a, sobrino/a,
+    hermano/a, esposo/a, tío/a, cuñado/a, primo/a, yerno, nuera, amigo/a,
+    vecino/a, cuidador/a…). "Familia" o "Vicho" no cuentan como parentesco.
+  - Nombre: `usuarios_app.nombre` sin lo que va entre paréntesis y con
+    mayúscula inicial ("jose" → "Jose"). Si no hay nombre, usa el primer apodo
+    que no sea parentesco.
+  - Frase: `tu {parentesco} {nombre}` / `tu {parentesco}` / `{nombre}` (sin
+    repetir "Martin Martin" ni "tu hijo Hijo") / genérica "te enviaron un…".
+- `app_mensajeria/services/intro_test.ts` — **Nuevo.** 16 tests (7 casos reales
+  de la BD + bordes). `deno test --no-check app_mensajeria/services/intro_test.ts`.
+- `app_mensajeria/index.ts` — Paso 3: `select("apodos_reconocimiento,
+  usuarios_app(nombre)")` (embebido por la FK `usuario_app_id`, igual que en
+  `contextService`). Paso 4: usa `construirFraseIntroductoria`. Un contacto
+  activo con `rol = null` ya no cae en la frase genérica.
+
+**Frases resultantes con los datos actuales:** "tu sobrino Jose", "tu hijo
+Martín", "tu hermana Ana", "Martin te envió…", "Hola Sra Juanita, tu nieto
+Vicente…". Un emisor fuera de `red_apoyo` sigue con "te enviaron un…".
+
+**Contratos:** sin cambios (MQTT, request/response de la app, llaves de
+`metadata_payload`). Solo cambia el **texto** de
+`metadata_payload.frase_introductoria`. `ttsService.ts`/`performanceUtils.ts`
+no se tocaron. El error de tipos preexistente de `performanceUtils.ts` sigue
+igual (no afecta al runtime).
+
+**Despliegue:** `app_mensajeria` **v13** (`verify_jwt=false`). Prueba de humo
+con una MAC inexistente → 403 (la función arranca e importa bien).
+
+**Mejoras detectadas y NO aplicadas (decisión de Vicente):** emisor fuera de la
+red se entrega igual; el Despacho 1 sale antes de confirmar que la nota existe
+en Storage; historial y MQTT pueden quedar desalineados (`Promise.all`);
+`StorageNotFoundError` responde 500 genérico; validación débil de
+`texto`/`audio_url`; "Hola Estimado"; error de BD al buscar el dispositivo
+responde 403; CORS incompleto en 405/OPTIONS.
+
+**Datos de prueba a limpiar (fuera del código):** `usuarios_app.nombre`
+"jose" (sin tilde) y "Martín (Cuidador Prueba)"; Martin con apodo `["martin"]`
+en vez de un parentesco; dos usuarios "Ana" (uno fuera de toda red).

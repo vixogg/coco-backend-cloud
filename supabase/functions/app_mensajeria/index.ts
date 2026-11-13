@@ -10,6 +10,7 @@ import {
   truncateTextBySentences,
   uint8ArrayToBase64Fast,
 } from "./services/performanceUtils.ts";
+import { construirFraseIntroductoria } from "./services/introService.ts";
 
 /* =========================================================================
    SECCIÓN 1: ERRORES TIPADOS DE DOMINIO
@@ -239,13 +240,16 @@ Deno.serve(async (req) => {
     const nombreAbuelo = cachedDisp.nombre_adulto;
 
     /* -----------------------------------------------------------------------
-       PASO 3: Consulta BD — Rol y apodos del emisor en la red de apoyo
+       PASO 3: Consulta BD — Apodos del emisor en la red de apoyo + su nombre real
        Ruta: red_apoyo WHERE dispositivo_id + usuario_app_id = emisor_id
+             └─ usuarios_app(nombre) vía FK usuario_app_id
+       NOTA: red_apoyo.rol es un nivel de permiso (ADMINISTRADOR|CONTACTO), no un
+       parentesco, por eso ya no se consulta ni se pronuncia.
        ----------------------------------------------------------------------- */
     console.log(`[BD] Buscando emisor ${emisor_id} en red de apoyo del dispositivo ${dispositivoId}`);
     const { data: contacto, error: errorContacto } = await supabase
       .from("red_apoyo")
-      .select("rol, apodos_reconocimiento")
+      .select("apodos_reconocimiento, usuarios_app(nombre)")
       .eq("dispositivo_id", dispositivoId)
       .eq("usuario_app_id", emisor_id)
       .eq("activo", true)
@@ -258,20 +262,26 @@ Deno.serve(async (req) => {
 
     /* -----------------------------------------------------------------------
        PASO 4: Construcción de la frase introductoria dinámica
+       "Hola Don Carlos, tu sobrino José te envió un audio."
        ----------------------------------------------------------------------- */
     const tipoContenido = tipo_mensaje === "AUDIO" ? "audio" : "mensaje";
-    let fraseIntroductoria: string;
+    // El embebido many-to-one puede venir como objeto o como arreglo según el tipado.
+    const usuarioEmbebido = (contacto as { usuarios_app?: unknown } | null)?.usuarios_app;
+    const usuarioEmisor = (Array.isArray(usuarioEmbebido) ? usuarioEmbebido[0] : usuarioEmbebido) as
+      | { nombre?: string | null }
+      | null
+      | undefined;
 
-    if (contacto && contacto.rol) {
-      const apodos: string[] = contacto.apodos_reconocimiento ?? [];
-      const nombreFamiliar = apodos.length > 0 ? apodos[0] : contacto.rol;
-      fraseIntroductoria =
-        `Hola ${nombreAbuelo}, tu ${contacto.rol} ${nombreFamiliar} te envió un ${tipoContenido}.`;
-      console.log(`[INTRO] Con datos del emisor: "${fraseIntroductoria}"`);
-    } else {
-      fraseIntroductoria = `Hola ${nombreAbuelo}, te enviaron un ${tipoContenido}.`;
-      console.log(`[INTRO] Fallback (emisor sin contacto): "${fraseIntroductoria}"`);
-    }
+    const fraseIntroductoria = construirFraseIntroductoria({
+      nombreAbuelo,
+      emisorEnRed: !!contacto,
+      nombreFamiliar: usuarioEmisor?.nombre ?? null,
+      apodos: (contacto?.apodos_reconocimiento as string[] | null | undefined) ?? [],
+      tipoContenido,
+    });
+    console.log(
+      `[INTRO] ${contacto ? "Con datos del emisor" : "Fallback (emisor fuera de red_apoyo)"}: "${fraseIntroductoria}"`,
+    );
 
     /* -----------------------------------------------------------------------
        PASO 5 + 6 + 7 (PARALELIZADO): Generación de audio, Persistencia en BD y Despacho MQTT
