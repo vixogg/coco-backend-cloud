@@ -6,7 +6,42 @@ function uint8ArrayToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return buffer;
 }
 
+/**
+ * Contrato público estable (no cambiar): transcribe sin pistas de vocabulario.
+ */
 export async function transcribeAudio(audio: Uint8Array): Promise<string> {
+  return await transcribeAudioWithHints(audio, []);
+}
+
+/**
+ * Agrega al query de Deepgram las palabras a reforzar (Iteración 10):
+ * - nova-3 → `keyterm=<palabra>` (Keyterm Prompting, sin intensificador).
+ * - nova-2 y anteriores → `keywords=<palabra>:<intensidad>` ("coco" con más peso).
+ */
+export function appendVocabularyHints(
+  params: URLSearchParams,
+  model: string,
+  hints: string[],
+): void {
+  const unicos = [...new Set(hints.map((h) => h.trim()).filter((h) => h.length > 0))];
+  if (unicos.length === 0) return;
+
+  if (model.startsWith("nova-3")) {
+    for (const h of unicos) params.append("keyterm", h);
+    return;
+  }
+
+  const intensidadNombre = Deno.env.get("DEEPGRAM_KEYWORD_BOOST") ?? "1.5";
+  for (const h of unicos) {
+    const intensidad = h.toLowerCase() === "coco" ? "2" : intensidadNombre;
+    params.append("keywords", `${h}:${intensidad}`);
+  }
+}
+
+export async function transcribeAudioWithHints(
+  audio: Uint8Array,
+  hints: string[],
+): Promise<string> {
   const apiKey = Deno.env.get("DEEPGRAM_API_KEY");
   if (!apiKey) {
     throw new DeepgramServiceError("DEEPGRAM_API_KEY is not configured");
@@ -28,7 +63,9 @@ export async function transcribeAudio(audio: Uint8Array): Promise<string> {
   if (sampleRate) params.set("sample_rate", sampleRate);
   if (channels) params.set("channels", channels);
   params.set("language", language);
-  params.set("model", Deno.env.get("DEEPGRAM_MODEL") ?? "nova-2");
+  const model = Deno.env.get("DEEPGRAM_MODEL") ?? "nova-2";
+  params.set("model", model);
+  appendVocabularyHints(params, model, hints);
 
   const url = `${DEEPGRAM_API_URL}?${params.toString()}`;
 
@@ -68,7 +105,7 @@ export async function transcribeAudio(audio: Uint8Array): Promise<string> {
 
     const transcript = alternatives[0]?.transcript;
     if (typeof transcript !== "string" || transcript.trim().length === 0) {
-      throw new DeepgramServiceError("Deepgram returned empty transcript");
+      throw new DeepgramEmptyTranscriptError();
     }
 
     return transcript.trim();
@@ -93,5 +130,13 @@ export class DeepgramServiceError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DeepgramServiceError";
+  }
+}
+
+/** Audio sin voz reconocible (silencio, ruido o habla muy baja). No es una falla del servicio. */
+export class DeepgramEmptyTranscriptError extends DeepgramServiceError {
+  constructor() {
+    super("Deepgram returned empty transcript");
+    this.name = "DeepgramEmptyTranscriptError";
   }
 }

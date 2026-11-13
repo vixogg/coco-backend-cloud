@@ -117,6 +117,19 @@ respuesta_sintetizada: string; }
   durante el Despacho 1 e inserción concurrente en `historial_interacciones`.
 - **[PENDIENTE] `app_gestion`:** Endpoints para que Martín administre la red de
   apoyo.
+- **[DESPLEGADO] Asistente conversacional (Iteración 10):**
+  `orquestador_iot` ahora conversa como asistente general: contexto del abuelo
+  (nombre, edad, fecha/hora local, red de apoyo), memoria corta (10 min),
+  herramientas gratuitas en tiempo real (clima Open-Meteo, noticias Google News
+  RSS, Wikipedia) y pistas de vocabulario para Deepgram. Contratos MQTT/BD sin
+  cambios. Desplegado como `orquestador_iot` v55 (2026-11-12).
+- **[DESPLEGADO] Herramientas de información real (Iteración 11 + 11.1):**
+  ENCICLOPEDIA conserva fechas, salta desambiguaciones (reintenta con "Chile") y
+  se complementa con la web para datos concretos o si no hay artículo; NOTICIAS
+  multifuente (Google ∥ Bing News ∥ Cooperativa); INDICADORES (findic.cl ∥
+  mindicador.cl), CALENDARIO (santoral/celebraciones Wikipedia, feriados boostr,
+  fase lunar local) y BUSQUEDA_WEB (Tavily con `TAVILY_API_KEY` ∥ respaldo Bing
+  RSS + Wikipedia, tope 4 s). Desplegado como `orquestador_iot` v58 (2026-11-12).
 
 ## 7. Protocolo de Agentes IA (Instrucción Autónoma)
 
@@ -689,3 +702,242 @@ vía Supabase MCP.
   inexistentes.
 - Realtime habilitado solo en `historial_interacciones`; `estado_reproduccion`
   siempre queda `PENDIENTE`.
+
+---
+
+### Iteración 10 — COCO como Asistente Conversacional (2026-11-12)
+
+**Objetivo:** Que COCO responda como un asistente de voz general (fecha/hora
+reales, clima, noticias, cultura general, charla natural, identidad del abuelo)
+sin perder el ruteo de mensajes, notas de voz ni SOS. Costo $0, latencia < 8 s,
+payload MQTT < 128 KB.
+
+**Diagnóstico (auditoría de código + BD vía MCP):**
+
+- El LLM no recibía fecha/hora, nombre del abuelo ni red de apoyo → inventaba el
+  año (2025), no sabía "cómo me llamo".
+- No había herramientas → "no tengo acceso en tiempo real".
+- Deepgram transcribía "COCO" como hugo/cuco/goku/gogo/google/copo… y el prompt
+  no tenía intención de charla → "¿quiere mandarle saludos a Hugo?".
+- Sin memoria: los diálogos de 2 turnos ("mándale un mensaje a…" → "que…") se
+  rompían. ~134 de 190 `MENSAJE` IA eran en realidad charla.
+- `qwen/qwen3.8-27b` en Groq usa modo "thinking" por defecto (no se enviaba
+  `reasoning_effort`).
+
+**Archivos tocados:**
+
+- `orquestador_iot/types.ts` — Tipos nuevos internos: `IntencionAsistente`
+  (incluye `CONVERSACION`), `Herramienta`, `RespuestaAsistente`,
+  `ResultadoAsistente`, `ContactoRed`, `TurnoReciente`,
+  `ContextoConversacional`. `GeminiResponse` **intacto**.
+- `orquestador_iot/services/contextService.ts` — **Nuevo.** `getDeviceContext`
+  (una consulta embebida dispositivo + adulto + red_apoyo + usuarios_app, caché
+  RAM 5 min, degrada a consulta mínima si falla), `buildFechaHoraLocal` (Intl),
+  `calcularEdad`, `getRecentTurns` (historial 10 min, timeout 800 ms, corre en
+  paralelo con Deepgram), `buildSttHints`.
+- `orquestador_iot/services/toolsService.ts` — **Nuevo.** `consultarClima`
+  (Open-Meteo geocoding CL+global en paralelo, elige por población; forecast 3
+  días; WMO→es), `consultarNoticias` (Google News RSS CL, portada o tema),
+  `consultarEnciclopedia` (Wikipedia es). Timeouts, caché TTL en RAM, sin API
+  keys.
+- `orquestador_iot/services/sttService.ts` — `transcribeAudioWithHints(audio,
+  hints)` (`keywords` en nova-2 con `coco:2`; `keyterm` si el modelo es
+  nova-3). `transcribeAudio` mantiene firma y delega. Nueva clase
+  `DeepgramEmptyTranscriptError`.
+- `orquestador_iot/services/llmService.ts` — SYSTEM_PROMPT nuevo y compacto
+  (~800 tokens), sobre JSON de 6 llaves (+`herramienta`,
+  `herramienta_parametro`), `responderConContexto` (pasada 1 → herramienta
+  opcional → pasada 2 con prompt mínimo que solo devuelve
+  `respuesta_sintetizada`), `reasoning_effort: "none"` para qwen3, reintento
+  corto de Groq ante 429 (`LLMRateLimitError` + `retry-after`), log de tokens,
+  `detectarEmergenciaLocal`. `classifyTranscription` conserva firma/contrato
+  (wrapper que mapea `CONVERSACION → MENSAJE`). `validateLLMResponse` intacto.
+- `orquestador_iot/index.ts` — Sección 3 usa `getDeviceContext`; Caso 3: STT ∥
+  memoria → `responderConContexto`; `CONVERSACION` se persiste como `MENSAJE`;
+  ruteo con contactos en caché (nombre real del familiar agregado como apodo);
+  red de seguridad SOS local si ambos LLM fallan; frase "No alcancé a
+  escucharle…" para audio vacío; SOS de hardware registrado aunque falle la IA.
+- `orquestador_iot/services/asistente_test.ts` — **Nuevo.** 29 tests unitarios
+  (`deno test --allow-env --no-check services/asistente_test.ts`).
+
+**Contratos:** MQTT (Andrés) sin cambios. BD sin migraciones (CHECK de
+`tipo_evento` intacto). `metadata_payload` con llaves **aditivas**:
+`respuesta_coco`, `intencion_ia` (`CONVERSACION|MENSAJE|…`),
+`herramienta_usada` (`CLIMA|NOTICIAS|ENCICLOPEDIA|null`). Firmas públicas de
+Diego intactas. `ttsService.ts`/`performanceUtils.ts` no se tocaron.
+
+**Variables de entorno nuevas (todas opcionales):** `GROQ_REASONING_EFFORT`
+(default `none` si el modelo es qwen3; `omit` para no enviarlo),
+`GROQ_RATE_LIMIT_MAX_WAIT_MS` (2500), `TOOL_TIMEOUT_MS` (3000),
+`DEEPGRAM_KEYWORDS` (lista por comas), `DEEPGRAM_KEYWORD_BOOST` (1.5).
+`LLM_MAX_OUTPUT_TOKENS` default sube a 220.
+
+**Pruebas en vivo (Groq real, sin audio):** "hola hugo cómo estás" →
+CONVERSACION; año 2026 y hora correctos; "cómo me llamo" → Don Carlos; clima
+mañana en Chiguayante vía Open-Meteo; noticias resumidas; Gabriela Mistral vía
+Wikipedia; "mándale un mensaje a mi hijo" → explica que no está registrado y
+ofrece Martín/José; mensaje de 2 turnos → José. Latencia LLM 0,6–1,1 s sin
+herramienta y ~2–5 s con herramienta.
+
+**⚠️ Restricción descubierta — límite del tier gratuito de Groq:**
+`qwen/qwen3.8-27b` tiene **7.000 tokens de entrada por minuto**. Cada turno
+consume ~1.250 tokens (pasada 2: ~300–400), o sea ~5 turnos/min. Ráfagas
+rápidas producen 429; el reintento corto ayuda, pero si la espera es larga se cae
+a Gemini, cuyo tier gratuito (`gemini-3.8-flash`: 5 RPM / 20 por día) suele
+fallar → audio de contingencia. Groq **no** tiene caché de prompt para qwen3.8
+(sí para `openai/gpt-oss-*`, cuyos tokens cacheados no cuentan para el límite).
+Evaluar cambio de `GROQ_MODEL` si el uso real lo requiere.
+
+**Pendiente:** desplegar `orquestador_iot`, probar con audio real (verificar que
+"COCO" deje de transcribirse como "hugo"), revisión del prompt por Diego,
+avisar a Martín de las llaves nuevas de `metadata_payload` (opcional filtrar la
+charla con `intencion_ia = 'CONVERSACION'`). Error de tipos preexistente en
+`performanceUtils.ts` (`Uint8ArrayWithNativeBase64` vs. tipado nativo de
+`toBase64` en Deno ≥ 2.9) — no bloquea el runtime.
+
+---
+
+### Iteración 11 — Herramientas de Información Real: Web, Chile y Calendario (2026-11-13)
+
+**Objetivo:** Que COCO responda datos puntuales y actuales (fechas de
+personajes, UF/dólar, santoral, feriados, luna, espectáculos, precios,
+resultados deportivos, actualidad) con fuentes gratuitas, herramientas < 2,5 s y
+ciclo total < 8 s.
+
+**Diagnóstico (historial + logs de v55, 12-nov):**
+
+- "¿Cuándo falleció Michael Jackson?" → `limpiarExtracto` borraba TODOS los
+  paréntesis, justo donde Wikipedia pone "(…Los Ángeles, 25 de junio de 2009)".
+- UF, bencina, luna, santo y Laura Pausini → al no existir una herramienta
+  adecuada, el LLM usaba ENCICLOPEDIA como comodín (respuestas sobre "IMACEC",
+  "Estadio Claro Arena", "programa espacial chino", "iglesia de Tenerife").
+- "Año de la independencia" → la pasada 2 decía "usa SOLO esos datos" y el
+  modelo no decía 1818 aunque lo sabe.
+- "Paro de camioneros" → `Timeout (3000ms) en news.google.com` desde Supabase,
+  sin fuente de respaldo; además Google News solo trae titulares.
+- "¿Me han llegado mensajes?" → COCO inventaba que había enviado mensajes.
+
+**Archivos tocados:**
+
+- `orquestador_iot/types.ts` — `Herramienta` += `INDICADORES`, `CALENDARIO`,
+  `BUSQUEDA_WEB`.
+- `orquestador_iot/services/toolsService.ts` — `limpiarExtracto` conserva
+  paréntesis con dígitos (5 oraciones, 1.100 chars). Parser RSS genérico
+  `parsearItemsRss` (CDATA, `<source>`/`<News:Source>`, descripción).
+  `consultarNoticias`: Google News ∥ Bing News (con resumen) ∥ Cooperativa
+  (portada), deduplicadas con `combinarNoticias`. Nuevas:
+  `consultarIndicadores` (findic.cl ∥ mindicador.cl, caché 30 min, formato
+  es-CL), `consultarCalendario` (Wikipedia "D de mes" → santoral y
+  celebraciones; `calcularFaseLunar` local; feriados `api.boostr.cl/holidays/
+  {año}.json` con lista de respaldo 2026–2027; `resolverFecha`), `buscarWeb`
+  (Tavily ∥ respaldo Bing News + Bing web filtrado con `esRelevante` + Wikipedia
+  `list=search`, en paralelo). `ejecutarHerramienta` recibe el timezone. Timeout
+  por defecto de 2,5 s.
+- `orquestador_iot/services/llmService.ts` — Guía de herramientas en el prompt
+  (cuándo usar cada una; ENCICLOPEDIA con solo el nombre; hechos históricos
+  sin herramienta); regla "no puedes leer mensajes recibidos";
+  `SYSTEM_PROMPT_PASADA2` responde exactamente lo preguntado, puede usar
+  conocimiento estable y nunca inventa cifras actuales; enums/esquema con las
+  herramientas nuevas; `TOOL_TIMEOUT_MS` default 2500.
+- `orquestador_iot/services/asistente_test.ts` — 39 tests (10 nuevos).
+
+**Fuentes probadas en vivo (gratis):** findic.cl (UF $41.316,06 al 12-11-2026),
+boostr feriados, Wikipedia día/santoral, Bing News RSS, Google News RSS,
+Cooperativa RSS. Descartadas: DuckDuckGo HTML (CAPTCHA a la 2ª consulta), DDG
+Instant (vacío), Brave (exige tarjeta), Groq Compound / Gemini grounding (pago).
+mindicador.cl respondía HTTP 500 (queda como respaldo).
+
+**Contratos:** MQTT y BD sin cambios. `metadata_payload.herramienta_usada` puede
+traer `INDICADORES|CALENDARIO|BUSQUEDA_WEB` (aditivo; avisar a Martín). Firmas
+públicas intactas. `ttsService.ts`/`performanceUtils.ts` no tocados.
+
+**Variables de entorno nuevas (opcionales):** `TAVILY_API_KEY` (cuenta gratis,
+1.000 búsquedas/mes, sin tarjeta), `TAVILY_SEARCH_DEPTH` (default `basic`).
+Sin key, BUSQUEDA_WEB usa el respaldo sin key.
+
+**Pruebas en vivo (Groq real, sin Tavily key, 13 preguntas reales que fallaban):**
+todas correctas. Michael Jackson → 25 de junio de 2009; UF → cuarenta y un mil
+trescientos dieciséis pesos; dólar; San Andrés → 30 de noviembre; santo de hoy;
+luna creciente; próximo feriado 8 de diciembre; Pausini → Viña 2027; bencina 97
+RM; paro de camioneros → acuerdo; Deportes Concepción 2-0 Everton;
+independencia → 1818 **sin herramienta**; "¿me han llegado mensajes?" → sin
+inventar. Herramientas 0–500 ms con caché o tibias (Wikipedia en frío ~1,7–2,5
+s). Ciclo LLM 0,6–3,6 s. Tokens: pasada 1 ≈ 1.500, pasada 2 ≈ 350–660.
+Ajustes posteriores: INDICADORES usa `Promise.any` (no espera a la fuente
+lenta); si una herramienta falla y es un hecho estable, la pasada 2 lo responde
+sin disculparse; montos redondeados a pesos enteros.
+
+**Despliegue:** `orquestador_iot` v57 (2026-11-12) con `TAVILY_API_KEY` creado
+por Vicente en los secrets. Pendiente: revisión del prompt por Diego.
+
+---
+
+### Iteración 11.1 — Refinamiento de ENCICLOPEDIA y BUSQUEDA_WEB (2026-11-12)
+
+**Objetivo:** que COCO quede preparado para preguntas nuevas de datos concretos
+(sin respuestas preparadas), a partir de las pruebas reales con v57.
+
+**Diagnóstico (historial ids 539–544 + logs v57):**
+
+- "Sierra Gorda: ubicación y habitantes" → Wikipedia devolvía la página de
+  **desambiguación** ("Sierra Gorda hace referencia a varios artículos:") y los
+  siguientes resultados eran de México. Además, el resumen de la comuna no trae
+  la población.
+- "¿Con quién juega Deportes Concepción la próxima fecha?" → **Tavily tardó
+  > 2,5 s desde Supabase** (lo normal ahí: 1,5–2,5 s), se cortó y el respaldo sin
+  key dio titulares antiguos: COCO dijo que el próximo rival era el último.
+- "¿Dónde queda la USM de Concepción?" → ENCICLOPEDIA no trae direcciones.
+- Se probó Wikidata como fuente estructurada: **descartado** (no tiene la
+  población de Sierra Gorda, 0,6–1,7 s por consulta y respuestas vacías por
+  límite de uso).
+
+**Archivos tocados:**
+
+- `services/toolsService.ts`:
+  - `consultarEnciclopediaDetalle`: 3 resultados con `pageprops=disambiguation`;
+    `esDesambiguacion` y `elegirArticuloWikipedia` saltan desambiguaciones; si el
+    mejor resultado era ambiguo, reintenta una vez con "<tema> Chile".
+  - `terminosDatoConcreto(pregunta)`: detecta si piden habitantes, dirección,
+    teléfono, horario, precio, superficie o altura.
+  - `enciclopediaConComplemento`: en esos casos, Wikipedia ∥ web **en
+    paralelo**; si Wikipedia no encuentra artículo, **cascada** a la web.
+  - `buscarWebDetalle` devuelve null si no hay resultados y acepta opciones
+    (`relevancia`, `sinWikipedia`). El complemento omite los fragmentos de
+    Wikipedia, que pierden el sujeto ("…858 habitantes" era de la aldea
+    Baquedano, no de la comuna).
+  - Si Tavily no responde, el respaldo llega marcado como `AVISO_FUENTE_SECUNDARIA`
+    ("pueden ser de fechas anteriores…") y no se guarda en caché.
+  - `ejecutarHerramienta(h, p, presupuestoPaso, tz, pregunta?)`: presupuesto
+    total del paso + topes por fuente (`TOOL_TIMEOUT_MS` 2500,
+    `TOOL_WEB_TIMEOUT_MS` 4000).
+- `services/llmService.ts`:
+  - Paso de herramienta con `TOOL_STEP_MAX_MS` (4500), recortado por el
+    presupuesto LLM de 8 s menos la reserva de la pasada 2. Se pasa la
+    transcripción a `ejecutarHerramienta`.
+  - Prompt de la pasada 1: ENCICLOPEDIA = descripción e historia, con aclaración
+    si el nombre es ambiguo ("Sierra Gorda comuna Chile", "Mercurio planeta").
+    BUSQUEDA_WEB = datos concretos: direcciones, teléfonos, horarios, próximos
+    partidos.
+  - Pasada 2: "usa cada dato solo para lo que el texto lo dice".
+- `services/asistente_test.ts`: 41 tests (2 nuevos: desambiguación y detección
+  de dato concreto).
+
+**Pruebas en vivo (sin Tavily en local), preguntas no vistas antes:**
+
+- Habitantes de Tomé → 54.946 (censo 2017).
+- Hospital Regional de Concepción → calle Independencia (no inventó el número).
+- Arturo Prat, Mercurio planeta, fundación de Valdivia (1552), Michael Jackson →
+  correctos.
+- Sede de la USM en Concepción → Hualpén.
+- Próximo partido de Colo-Colo → U. Católica, domingo 22.
+- Sierra Gorda → ubicación correcta; sin Tavily dice con honestidad que no tiene
+  la cifra (antes daba 858 por error).
+
+Latencia LLM: 1,4–2,3 s.
+
+**Contratos:** sin cambios (MQTT, BD, `metadata_payload`, firmas públicas).
+Variables nuevas opcionales: `TOOL_WEB_TIMEOUT_MS`, `TOOL_STEP_MAX_MS`.
+Desplegado como `orquestador_iot` **v58**.
+
+**Pendiente:** verificar en producción, con Tavily, las preguntas de dato
+concreto (logs `[TOOL ENCICLOPEDIA]`); revisión del prompt por Diego.

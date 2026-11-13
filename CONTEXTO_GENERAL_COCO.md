@@ -184,6 +184,52 @@ audio WAV (Base64) ─► decode ─► [STT Deepgram] ─► texto
   auxilio) → `ALERTA_SOS`. Incluye ejemplos few-shot (mensaje a hija María,
   recordatorio de pastilla, audio a nieto, "me caí", saludo "Hola COCO").
 
+> **Actualización Iteración 10 (asistente conversacional, implementado y aún no
+> desplegado):** `orquestador_iot` ya no llama a `classifyTranscription` (que
+> sigue existiendo con la misma firma, como *wrapper*). Ahora usa
+> `responderConContexto(transcripción, mac, tipo, contexto)`:
+>
+> - **Contexto inyectado** (`buildContextMessage`, reemplaza a
+>   `buildUserMessage`): fecha y hora local (Intl + `dispositivos_coco.timezone`),
+>   nombre y edad del abuelo, red de apoyo (nombres y apodos, sin el `rol`),
+>   últimos 3 turnos (10 min) y la transcripción. La MAC ya no se envía al LLM.
+> - **Sobre JSON interno de 6 llaves:** las 4 de `GeminiResponse`, más
+>   `herramienta` (`NINGUNA|CLIMA|NOTICIAS|ENCICLOPEDIA`) y
+>   `herramienta_parametro`. La nueva intención interna `CONVERSACION` es la
+>   opción por defecto y se persiste como `MENSAJE`.
+> - **2 pasadas:** si el LLM pide una herramienta, `toolsService.ts` consulta
+>   Open-Meteo, Google News RSS CL o Wikipedia (gratis, sin key, timeout 3 s) y
+>   una 2ª llamada con un prompt mínimo redacta la respuesta. Todo comparte el
+>   presupuesto de 8 s.
+> - Groq: se envía `reasoning_effort: "none"` para qwen3, hay un reintento corto
+>   ante 429 y `max_tokens` es 220. Si ambos LLM fallan y la frase tiene señales
+>   claras de emergencia → ALERTA_SOS local (`detectarEmergenciaLocal`).
+> - Deepgram: `transcribeAudioWithHints` envía `keywords` (`coco:2` + nombres y
+>   apodos reales). Con nova-3 usa `keyterm`.
+> - ⚠️ **Límite del tier gratuito de Groq** (`qwen/qwen3.8-27b`): 7.000 tokens
+>   de entrada por minuto. Cada turno usa ~1.250–1.450 tokens, o sea ~4–5 turnos/min.
+>
+> **Actualización Iteración 11 (desplegada, `orquestador_iot` v58):** 6
+> herramientas, todas gratis, con timeout de 2,5 s y fuentes en paralelo:
+>
+> | Herramienta | Fuente | Para qué |
+> | --- | --- | --- |
+> | `CLIMA` | Open-Meteo | Pronóstico de 3 días |
+> | `NOTICIAS` | Google News RSS ∥ Bing News RSS ∥ Cooperativa | Actualidad con resumen |
+> | `ENCICLOPEDIA` | Wikipedia es (conserva fechas entre paréntesis) | Biografías, historia, lugares |
+> | `INDICADORES` | findic.cl → mindicador.cl | UF, dólar, euro, UTM, IPC, cobre… |
+> | `CALENDARIO` | Wikipedia "D de mes" + api.boostr.cl + cálculo local | Santoral, celebraciones, feriados, fase lunar |
+> | `BUSQUEDA_WEB` | Tavily (si hay `TAVILY_API_KEY`) ∥ Bing News + Bing web (filtrado por relevancia) + Wikipedia | Precios, espectáculos, deportes, resto |
+>
+> La pasada 2 responde exactamente lo preguntado, puede usar conocimiento
+> estable (historia) y nunca inventa cifras actuales.
+>
+> **Iteración 11.1 (v58):**
+> - ENCICLOPEDIA salta las desambiguaciones (reintenta con "Chile").
+> - Cuando la pregunta pide un dato concreto (habitantes, dirección, horario…), ENCICLOPEDIA consulta Wikipedia y la web en paralelo; si no hay artículo, pasa en cascada a la web.
+> - BUSQUEDA_WEB tiene un tope de 4 s, porque Tavily tarda 1,5–2,5 s desde Supabase.
+> - El respaldo sin key llega marcado como fuente secundaria.
+
 ### 4.3 Validación post-LLM (`validateLLMResponse`)
 
 Es la compuerta que garantiza el contrato antes de que el backend use el JSON:
@@ -321,6 +367,9 @@ Respuesta 200:
 | `tipo_mensaje_original` | `TEXTO`\|`AUDIO` | Solo registros `emisor = APP`.                                                                                                                                                                    |
 | `frase_introductoria`   | string           | Solo `APP`: intro que se sintetizó ("Hola Don Carlos, tu … te envió un audio.").                                                                                                                  |
 | `duracion_segundos`     | null             | Solo `APP`; reservado, hoy siempre `null`.                                                                                                                                                        |
+| `respuesta_coco`        | string           | **Iteración 10.** Solo en Caso 3: lo que COCO le respondió al abuelo (texto truncado que se envió a TTS). Alimenta la memoria corta.                                                            |
+| `intencion_ia`          | string           | **Iteración 10.** Solo en Caso 3: `CONVERSACION`, `MENSAJE`, `ALERTA_SOS`, `RECORDATORIO` o `AUDIO_DIRECTO`. La charla se guarda con `tipo_evento = MENSAJE`; esta llave permite filtrarla.     |
+| `herramienta_usada`     | string \| null   | **Iteración 10–11.** Solo en Caso 3: `CLIMA`, `NOTICIAS`, `ENCICLOPEDIA`, `INDICADORES`, `CALENDARIO`, `BUSQUEDA_WEB` o `null`.                                                               |
 | `ruta_storage`          | string           | **Legado** (Iteración 2, 9 filas). Reemplazado por `url_audio_referencia`.                                                                                                                        |
 | `fallback_ia`           | boolean          | **Legado** (9 filas antiguas). Ya no se escribe.                                                                                                                                                  |
 
@@ -572,7 +621,8 @@ inicia sesión con Supabase Auth; el `id` de `auth.users` es el
 | Deepgram     | `DEEPGRAM_API_KEY`, `DEEPGRAM_CONTENT_TYPE`, opc.: `DEEPGRAM_LANGUAGE`, `DEEPGRAM_MODEL`, `DEEPGRAM_ENCODING`, `DEEPGRAM_SAMPLE_RATE`, `DEEPGRAM_CHANNELS`, `DEEPGRAM_TIMEOUT_MS` |
 | Groq         | `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_TIMEOUT_MS`                                                                                                                                   |
 | Gemini       | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_API_VERSION`, opc.: `GEMINI_TIMEOUT_MS`, `GEMINI_MAX_RETRIES`, `GEMINI_RETRY_DELAY_MS`                                                  |
-| LLM común    | `LLM_TOTAL_TIMEOUT_MS` (8000), `LLM_MAX_OUTPUT_TOKENS` (180)                                                                                                                      |
+| LLM común    | `LLM_TOTAL_TIMEOUT_MS` (8000), `LLM_MAX_OUTPUT_TOKENS` (220 desde la Iteración 10)                                                                                                |
+| Asistente (It. 10, opcionales) | `GROQ_REASONING_EFFORT` (`none` automático en qwen3; `omit` para no enviarlo), `GROQ_RATE_LIMIT_MAX_WAIT_MS` (2500), `TOOL_TIMEOUT_MS` (2500, tope por fuente), `TOOL_WEB_TIMEOUT_MS` (4000, búsqueda web), `TOOL_STEP_MAX_MS` (4500, paso de herramienta completo), `DEEPGRAM_KEYWORDS` (lista separada por comas), `DEEPGRAM_KEYWORD_BOOST` (1.5), `TAVILY_API_KEY` (It. 11; gratis 1.000/mes, sin tarjeta), `TAVILY_SEARCH_DEPTH` (`basic`) |
 | ElevenLabs   | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL_ID`, `ELEVENLABS_TIMEOUT_MS`                                                                                       |
 | Límites      | `MAX_RAW_AUDIO_BYTES` (65000), `MAX_TTS_CHARS` (240), `MAX_RAW_VOICE_NOTE_BYTES` (94000), `MAX_MENS_TEXTO_CHARS` (340)                                                            |
 | Obsoletas    | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `POLLY_*` (Polly), `MAX_AUDIO_BASE64_BYTES` (no lo lee el código)                                                     |
@@ -610,6 +660,8 @@ inicia sesión con Supabase Auth; el `id` de `auth.users` es el
 | Componente                            | Estado                                                                                  |
 | ------------------------------------- | --------------------------------------------------------------------------------------- |
 | `orquestador_iot`                     | ✅ Completo y optimizado (latencia, idempotencia, bytes, contingencia). Desplegado v54. |
+| Asistente conversacional (It. 10)     | ✅ Desplegado (`orquestador_iot` v55) y probado con el hardware.                         |
+| Herramientas de información (It. 11 / 11.1) | ✅ Desplegado (`orquestador_iot` v58) con `TAVILY_API_KEY`. 41 tests. |
 | `app_mensajeria`                      | ✅ Completo y paralelizado. Desplegado v11. Falta validación JWT.                       |
 | `app_gestion`                         | ⏳ Placeholder (no desplegado; columnas incorrectas en el código comentado).            |
 | Recordatorios (`RECORDATORIO`)        | ⏳ Solo se registran; agendamiento = Fase 2 (no hay `pg_cron`).                         |

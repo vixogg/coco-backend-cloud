@@ -1,8 +1,11 @@
 import { createClient } from "npm:@supabase/supabase-js";
 
 // 1. Importaciones de la IA y utilitarios de alto rendimiento
-import { transcribeAudio } from "./services/sttService.ts";
-import { classifyTranscription } from "./services/llmService.ts";
+import {
+  DeepgramEmptyTranscriptError,
+  transcribeAudioWithHints,
+} from "./services/sttService.ts";
+import { detectarEmergenciaLocal, responderConContexto } from "./services/llmService.ts";
 import { synthesizeSpeech } from "./services/ttsService.ts";
 import { AwsClient } from "npm:aws4fetch";
 import {
@@ -10,16 +13,22 @@ import {
   decodeBase64ToUint8ArrayFast,
   ensureSafeAudioPayloadSize,
   findBestContactMatch,
-  getCachedDevice,
   getOrSynthesizeTtsBase64,
   isDuplicateInMemoryL1,
   logSafePayload,
   RedApoyoContact,
   runInBackground,
-  setCachedDevice,
   truncateTextBySentences,
   uint8ArrayToBase64Fast,
 } from "./services/performanceUtils.ts";
+import {
+  buildContextoConversacional,
+  buildSttHints,
+  DeviceContext,
+  getDeviceContext,
+  getRecentTurns,
+} from "./services/contextService.ts";
+import type { ContactoRed, ResultadoAsistente, TipoEvento } from "./types.ts";
 
 /* =========================================================================
    SECCIÓN 1: CONFIGURACIÓN E INICIALIZACIÓN GLOBAL POR ISOLATE
@@ -44,6 +53,23 @@ const FRASE_SOS_ESTATICA = "Alerta de emergencia enviada a tu familia. Mantén l
 const FRASE_CONFIRMACION_AUDIO = "Tu mensaje fue enviado exitosamente.";
 const FRASE_CONTINGENCIA_ERROR =
   "Disculpe, tuve un inconveniente al procesar su consulta. Por favor intente de nuevo.";
+const FRASE_NO_ESCUCHE = "No alcancé a escucharle bien. ¿Me lo puede repetir, por favor?";
+
+/**
+ * Convierte la red de apoyo al formato de findBestContactMatch, agregando el nombre real del
+ * familiar como un apodo más (el LLM puede referirse a "José" aunque el apodo sea "sobrino").
+ */
+function contactosParaRuteo(red: ContactoRed[]): RedApoyoContact[] {
+  return red.map((c) => {
+    const nombre = (c.nombre ?? "").replace(/\s*\(.*?\)\s*/g, " ").trim();
+    const extras = nombre ? [nombre, nombre.split(" ")[0]] : [];
+    return {
+      usuario_app_id: c.usuario_app_id,
+      rol: c.rol,
+      apodos_reconocimiento: [...(c.apodos_reconocimiento ?? []), ...extras],
+    };
+  });
+}
 
 // Singleton perezoso para AwsClient (reutiliza configuración y evita re-instanciar en cada request)
 let cachedAwsClient: AwsClient | null = null;
@@ -132,6 +158,9 @@ Deno.serve(async (req) => {
   }
 
   let macAddressValidada: string | null = null;
+  let dispositivoValidado: DeviceContext | null = null;
+  let tipoEventoEntrante: string | null = null;
+  let persistenciaIaLanzada = false;
 
   try {
     const bodyText = await req.text();
@@ -191,33 +220,21 @@ Deno.serve(async (req) => {
 
     /* =========================================================================
        SECCIÓN 3: SEGURIDAD Y VERIFICACIÓN DEL GEMELO DIGITAL (CON CACHÉ RAM)
+       Una sola consulta embebida trae dispositivo + adulto mayor + red de apoyo
+       (contexto del asistente). Caché RAM 5 min → 0 ms en peticiones siguientes.
        ========================================================================= */
-    let dispositivo = getCachedDevice(mac_address);
+    const dispositivo = await getDeviceContext(supabase, mac_address);
 
     if (!dispositivo) {
-      const { data: dispDb, error: errorDispositivo } = await supabase
-        .from("dispositivos_coco")
-        .select("id, adulto_mayor_id")
-        .eq("mac_address", mac_address)
-        .single();
-
-      if (errorDispositivo || !dispDb) {
-        console.warn(`[BLOQUEO] Dispositivo no registrado en BD: ${mac_address}`);
-        return new Response(JSON.stringify({ error: "Dispositivo no autorizado" }), {
-          status: 403,
-        });
-      }
-
-      setCachedDevice(mac_address, {
-        id: dispDb.id,
-        adulto_mayor_id: dispDb.adulto_mayor_id,
+      console.warn(`[BLOQUEO] Dispositivo no registrado en BD: ${mac_address}`);
+      return new Response(JSON.stringify({ error: "Dispositivo no autorizado" }), {
+        status: 403,
       });
-      dispositivo = getCachedDevice(mac_address)!;
-    } else {
-      console.log(`[DEVICE CACHE HIT] Dispositivo ${mac_address} validado en memoria (0ms).`);
     }
 
     macAddressValidada = mac_address;
+    dispositivoValidado = dispositivo;
+    tipoEventoEntrante = tipo_evento;
 
     /* =========================================================================
        SECCIÓN 4: ORQUESTACIÓN IA Y BYPASS DE HARDWARE
@@ -372,23 +389,53 @@ Deno.serve(async (req) => {
     if (formato_payload === "AUDIO_B64") {
       console.log(`[PROCESAMIENTO IA] Audio recibido para MAC: ${mac_address}`);
       const decodedAudio = decodeBase64ToUint8ArrayFast(data);
-      const transcription = await transcribeAudio(decodedAudio);
 
-      const classification = await classifyTranscription(
-        transcription,
-        mac_address,
-        tipo_evento as "MENSAJE" | "ALERTA_SOS",
+      // STT (con pistas de vocabulario del dispositivo) y memoria corta EN PARALELO:
+      // la lectura del historial (~100-300 ms) queda oculta tras Deepgram (~700 ms).
+      const [transcription, turnosRecientes] = await Promise.all([
+        transcribeAudioWithHints(decodedAudio, buildSttHints(dispositivo)),
+        getRecentTurns(supabase, dispositivo.id),
+      ]);
+      console.log(
+        `[STT] "${transcription}" | memoria=${turnosRecientes.length} turno(s)`,
       );
+
+      const contexto = buildContextoConversacional(dispositivo, turnosRecientes);
+      let respuestaIa: ResultadoAsistente;
+      try {
+        respuestaIa = await responderConContexto(
+          transcription,
+          mac_address,
+          tipo_evento as TipoEvento,
+          contexto,
+        );
+      } catch (llmError) {
+        // Red de seguridad: si ningún LLM respondió (p. ej. límite de tokens) y la frase tiene
+        // señales claras de emergencia, se trata como ALERTA_SOS en vez de perderla.
+        if (!detectarEmergenciaLocal(transcription)) throw llmError;
+        console.error(
+          `[SOS LOCAL] LLM no disponible (${llmError instanceof Error ? llmError.message : llmError}). Emergencia detectada por palabras clave.`,
+        );
+        respuestaIa = {
+          intencion_detectada: "ALERTA_SOS",
+          destinatario_identificado: null,
+          prioridad_sugerida: "URGENTE",
+          herramienta: "NINGUNA",
+          herramienta_parametro: null,
+          herramienta_usada: "NINGUNA",
+          respuesta_sintetizada: FRASE_SOS_ESTATICA,
+        };
+      }
 
       // Segunda barrera determinista de longitud de texto antes de ElevenLabs
       const textoSeguroTts = truncateTextBySentences(
-        classification.respuesta_sintetizada,
+        respuestaIa.respuesta_sintetizada,
         MAX_TTS_CHARS,
       );
 
       // CONFIRMACION_ESCUCHA — Gatillo para que Andrés abra el micrófono
       const tipoEventoBajada =
-        classification.intencion_detectada === "AUDIO_DIRECTO"
+        respuestaIa.intencion_detectada === "AUDIO_DIRECTO"
           ? "CONFIRMACION_ESCUCHA"
           : "RESPUESTA_IA";
 
@@ -402,39 +449,40 @@ Deno.serve(async (req) => {
          SECCIÓN 5 (PARALELA / BACKGROUND): ENRUTAMIENTO Y PERSISTENCIA EN BD
          Se lanza en segundo plano mediante EdgeRuntime.waitUntil para no sumar
          los ~300-450ms de PostgreSQL al tiempo de respuesta del parlante.
+         "CONVERSACION" es interna: se persiste como "MENSAJE" (CHECK de BD intacto)
+         y se distingue con metadata_payload.intencion_ia.
          ======================================================================= */
-      const tipo_evento_db: string = classification.intencion_detectada;
-      const destinatarioIdentificado = classification.destinatario_identificado;
-      const prioridadSugerida = classification.prioridad_sugerida;
+      const intencionIa = respuestaIa.intencion_detectada;
+      const tipo_evento_db: string = intencionIa === "CONVERSACION" ? "MENSAJE" : intencionIa;
+      const destinatarioIdentificado = respuestaIa.destinatario_identificado;
+      const prioridadSugerida = respuestaIa.prioridad_sugerida;
 
+      persistenciaIaLanzada = true;
       runInBackground(
         (async () => {
           let destinatario_uuid: string | null = null;
 
-          if (tipo_evento_db === "MENSAJE" && destinatarioIdentificado) {
-            console.log(
-              `[RUTEO] Buscando UUID en red_apoyo para el apodo/rol: "${destinatarioIdentificado}"`,
+          // Ruteo solo para mensajes reales a un familiar (nunca para la charla).
+          if (intencionIa === "MENSAJE" && destinatarioIdentificado) {
+            destinatario_uuid = findBestContactMatch(
+              contactosParaRuteo(dispositivo.red_apoyo),
+              destinatarioIdentificado,
             );
-            const { data: contactosActivos, error: errContactos } = await supabase
-              .from("red_apoyo")
-              .select("usuario_app_id, rol, apodos_reconocimiento")
-              .eq("dispositivo_id", dispositivo.id)
-              .eq("activo", true);
-
-            if (errContactos) {
-              console.warn(`[RUTEO WARN] Error consultando red_apoyo: ${errContactos.message}`);
-            } else if (contactosActivos && contactosActivos.length > 0) {
-              destinatario_uuid = findBestContactMatch(
-                contactosActivos as RedApoyoContact[],
-                destinatarioIdentificado,
-              );
-            }
+            console.log(
+              `[RUTEO] "${destinatarioIdentificado}" → ${destinatario_uuid ?? "sin coincidencia en red_apoyo"}`,
+            );
           }
 
+          // Llaves aditivas (Iteración 10): respuesta_coco, intencion_ia, herramienta_usada.
           const metadata_payload = {
             texto_procesado: transcription,
             url_audio_referencia: null,
             procesado_por_ia: true,
+            respuesta_coco: textoSeguroTts,
+            intencion_ia: intencionIa,
+            herramienta_usada: respuestaIa.herramienta_usada === "NINGUNA"
+              ? null
+              : respuestaIa.herramienta_usada,
           };
 
           const { error: errorInsert } = await supabase
@@ -457,9 +505,13 @@ Deno.serve(async (req) => {
                 console.log(`[EMERGENCIA] Alerta SOS registrada para el dispositivo ${dispositivo.id}.`);
                 break;
               case "MENSAJE":
-                console.log(
-                  `[MENSAJE] Entregado al buzón asíncrono del UUID: ${destinatario_uuid || "Desconocido"}.`,
-                );
+                if (intencionIa === "CONVERSACION") {
+                  console.log(`[CONVERSACION] Turno de charla registrado (memoria corta).`);
+                } else {
+                  console.log(
+                    `[MENSAJE] Entregado al buzón asíncrono del UUID: ${destinatario_uuid || "Desconocido"}.`,
+                  );
+                }
                 break;
               case "AUDIO_DIRECTO":
                 console.log(`[AUDIO DIRECTO] Solicitud de apertura de micrófono registrada.`);
@@ -515,10 +567,30 @@ Deno.serve(async (req) => {
     // de AWS IoT Core NO reintente el Webhook 2 veces más.
     if (macAddressValidada) {
       const macDestino = macAddressValidada;
+      const dispositivoError = dispositivoValidado;
+
+      // (a) SOS por voz a prueba de fallos: si el hardware avisó ALERTA_SOS y la IA no pudo
+      //     procesar el audio, la alerta se registra igual y se responde con la frase SOS.
+      const esSosNoRegistrado = tipoEventoEntrante === "ALERTA_SOS" && !persistenciaIaLanzada &&
+        dispositivoError !== null;
+      // (b) Audio sin voz reconocible: se pide repetir (no es un "inconveniente" del sistema).
+      const esAudioVacio = error instanceof DeepgramEmptyTranscriptError;
+
+      const frase = esSosNoRegistrado
+        ? FRASE_SOS_ESTATICA
+        : esAudioVacio
+        ? FRASE_NO_ESCUCHE
+        : FRASE_CONTINGENCIA_ERROR;
+      const etiqueta = esSosNoRegistrado
+        ? "SOS_VOZ_CONTINGENCIA"
+        : esAudioVacio
+        ? "AUDIO_VACIO"
+        : "CONTINGENCIA_ERROR";
+
       runInBackground(
         (async () => {
           const audioContingenciaB64 = await getOrSynthesizeTtsBase64(
-            FRASE_CONTINGENCIA_ERROR,
+            frase,
             synthesizeSpeech,
             MAX_RAW_AUDIO_BYTES,
           );
@@ -526,18 +598,48 @@ Deno.serve(async (req) => {
             macDestino,
             "RESPUESTA_IA",
             audioContingenciaB64,
-            "NORMAL",
-            "CONTINGENCIA_ERROR",
+            esSosNoRegistrado ? "URGENTE" : "NORMAL",
+            etiqueta,
           );
         })(),
-        "contingencia_error_audio",
+        `contingencia_${etiqueta.toLowerCase()}`,
       );
+
+      if (esSosNoRegistrado && dispositivoError) {
+        runInBackground(
+          (async () => {
+            const { error: errorInsertSos } = await supabase
+              .from("historial_interacciones")
+              .insert({
+                dispositivo_id: dispositivoError.id,
+                emisor: "COCO",
+                destinatario_id: null,
+                tipo_evento: "ALERTA_SOS",
+                metadata_payload: {
+                  texto_procesado: "Alerta SOS registrada en contingencia (falló el procesamiento del evento).",
+                  url_audio_referencia: null,
+                  procesado_por_ia: false,
+                },
+                estado_reproduccion: "PENDIENTE",
+                prioridad: "URGENTE",
+              });
+            if (errorInsertSos) {
+              console.error(`[BD ERROR SOS VOZ] ${errorInsertSos.message}`);
+            } else {
+              console.log(`[EMERGENCIA] Alerta SOS por voz registrada pese a la falla de IA.`);
+            }
+          })(),
+          "persistencia_sos_voz_contingencia",
+        );
+      }
 
       return new Response(
         JSON.stringify({
           success: false,
           handled_error: true,
-          error: "Fallo controlado en el orquestador (contingencia activada)",
+          error: esAudioVacio
+            ? "Audio sin voz reconocible (se pidió repetir)"
+            : "Fallo controlado en el orquestador (contingencia activada)",
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
